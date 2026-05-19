@@ -8,8 +8,8 @@ anyhow = "1.0.102"
 clap = { version = "4.6.0", features = ["derive"] }
 ms-pdb = "0.1.22"
 object = "0.38.1"
-pdb_wrapper = { git = "https://github.com/kvasszn/pdb_wrapper", version = "0.2.2" }
-#pdb_wrapper = { path = "../pdb_wrapper", version = "0.2.2" }
+#pdb_wrapper = { git = "https://github.com/kvasszn/pdb_wrapper", version = "0.2.2" }
+pdb_wrapper = { path = "../pdb_wrapper", version = "0.2.2" }
 regex = "1.12.3"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"

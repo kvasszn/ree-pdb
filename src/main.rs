@@ -758,6 +758,9 @@ fn add_types(
                 .get(name.as_str())
                 .filter(|variants| !variants.is_empty())
             {
+                if verbose {
+                    println!("[INFO] Adding Enum {}", name);
+                }
                 let variants: Vec<PDBEnumVariant> = variants
                     .iter()
                     .map(|variant| PDBEnumVariant {
