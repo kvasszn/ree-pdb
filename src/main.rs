@@ -61,7 +61,6 @@ struct PdbArgs {
     #[arg(short, long)]
     verbose: bool,
     #[arg(
-        short,
         long,
         // it doesn't work with 0x140000000 and 0th segment, I'm probably just dumb though
         default_value_t = 0x140001000,
