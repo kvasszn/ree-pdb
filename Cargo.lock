@@ -505,6 +505,7 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 [[package]]
 name = "pdb_wrapper"
 version = "0.2.2"
+source = "git+https://github.com/kvasszn/pdb_wrapper#13dfa1e304b96d486ae5b505ade67c9e65011310"
 dependencies = [
  "bindgen",
  "cmake",
