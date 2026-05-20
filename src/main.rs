@@ -310,45 +310,26 @@ fn add_types(
             println!("Adding Type {name}");
         }
 
-        let mut virtual_methods: Vec<&REMethod> = t
-            .methods
-            .values()
-            .filter(|m| m.vtable_index.is_some())
-            .collect();
-
         let is_value_type = t.parent.as_str() == "System.ValueType";
 
         // value types shouldnt have vtables in their structs
         // TODO: maybe i should add a boxed type with a vtable
         // If it's a managed object type
-        if !is_value_type {
-            // moove this into a get_vtable_struct
-            // safe to unwrap here since the above filters by is_some
-            virtual_methods.sort_by_key(|m| m.vtable_index.unwrap());
-            let vtable_name = format!("{}__vtable", name);
-            let mut vtable_fields = vec![];
-            vtable_fields.push(StructField {
-                ty: PDBType::Pointer(Box::new(PDBType::SimpleType(SimpleTypeKind::Void))),
-                name: "__type_definition".to_string(),
-                offset: 0,
-                is_static: false
-            });
-            let mut max_vtable_size = 0;
-            for method in &virtual_methods {
-                let v_idx = method.vtable_index.unwrap() as u64;
-                let pdb_func = method.get_pdb_function(Some(&name), il2cpp);
-                let func_ptr_type = PDBType::Pointer(Box::new(PDBType::Function(pdb_func)));
-                let offset = v_idx * 8 + 8;
-                vtable_fields.push(StructField {
-                    ty: func_ptr_type,
-                    name: method.name.clone(),
-                    offset,
-                    is_static: false,
-                });
-                max_vtable_size = max_vtable_size.max(offset + 8);
+        // Value Types
+        if is_value_type {
+            let (struct_fields, inherited_fields_added) = t.get_struct_fields(il2cpp)?;
+            stats.inherited_fields_added += inherited_fields_added;
+            pdb.insert_struct(&name, &struct_fields, t.size as u64)?;
+            stats.structs_added += 1;
+        }
+        if !is_value_type && t.flags.contains(&RETypeFlag::ManagedVTable) {
+            let vtable_name = format!("{}__vtable", &name);
+            let (vtable_size, vtable_fields) = t.get_struct_vtable(il2cpp)?;
+
+            if verbose {
+                println!("Adding vtable {vtable_name}");
             }
-            //println!("Adding vtable {vtable_name}");
-            pdb.insert_struct(&vtable_name, &vtable_fields, max_vtable_size)?;
+            pdb.insert_struct(&vtable_name, &vtable_fields, vtable_size)?;
             stats.structs_added += 1;
 
             let (mut main_struct_fields, inherited_fields_added) = t.get_struct_fields(il2cpp)?;
@@ -407,7 +388,7 @@ fn add_types(
                 let sym_name = function.symbol_name(t);
                 let mut param_names = vec![];
                 param_names.push("vmctx");
-                if function.impl_flags.contains("HasThis") {
+                if function.impl_flags.contains(&REImplFlag::HasThis) {
                     param_names.push("this");
                 }
 
