@@ -1,23 +1,33 @@
+pub mod il2cpp;
+pub mod enums;
+pub mod util;
+
+use crate::enums::EnumMap;
+use crate::enums::load_enum_map;
+use crate::enums::resolve_enum_path;
+use crate::util::*;
+use crate::il2cpp::*;
+
 use std::{
     collections::{HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
     time::Instant,
+    fmt::Display
 };
 
-use anyhow::Result;
 use clap::Parser;
 use object::{Object, ObjectSection, read::pe::PeFile64};
 use pdb_wrapper::{
     PDB, PDBEnumVariant, PDBFunction, PDBType, StructField,
     pdb_meta::{CallingConvention, SimpleTypeKind},
 };
+use anyhow::Result;
 use regex::Regex;
-use serde::{Deserialize, Deserializer};
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
-struct PdbArgs {
+pub struct PdbArgs {
     #[arg(
         short,
         long,
@@ -153,457 +163,6 @@ struct AddStats {
     functions_skipped_outside_sections: usize,
 }
 
-#[derive(Debug, Clone)]
-struct EnumVariant {
-    name: String,
-    value: u64,
-    is_unsigned: bool,
-}
-
-type EnumMap = HashMap<String, Vec<EnumVariant>>;
-
-// idk if this should be part of the REType, or something else
-// lowkirkenuenly i should rewrite this whole program
-pub fn get_pdb_type(type_name: &str, il2cpp: &Il2Cpp) -> PDBType {
-    match type_name {
-        "System.Boolean" => PDBType::SimpleType(SimpleTypeKind::Boolean8),
-        "System.SByte" => PDBType::SimpleType(SimpleTypeKind::SByte),
-        "System.Int16" => PDBType::SimpleType(SimpleTypeKind::Int16),
-        "System.Int32" => PDBType::SimpleType(SimpleTypeKind::Int32),
-        "System.Int64" => PDBType::SimpleType(SimpleTypeKind::Int64),
-        "System.Byte" => PDBType::SimpleType(SimpleTypeKind::Byte),
-        "System.UInt16" => PDBType::SimpleType(SimpleTypeKind::UInt16),
-        "System.UInt32" => PDBType::SimpleType(SimpleTypeKind::UInt32),
-        "System.UInt64" => PDBType::SimpleType(SimpleTypeKind::UInt64),
-        "System.Single" => PDBType::SimpleType(SimpleTypeKind::Float32),
-        "System.Double" => PDBType::SimpleType(SimpleTypeKind::Float64),
-        "System.Char" => PDBType::SimpleType(SimpleTypeKind::WideCharacter),
-        "System.Void" => PDBType::SimpleType(SimpleTypeKind::Void),
-        "System.Guid" => {
-            PDBType::ConstantArray(Box::new(PDBType::SimpleType(SimpleTypeKind::Byte)), 16)
-        }
-        _ => {
-            if let Some(t) = il2cpp.get(type_name) {
-                if t.parent == "System.ValueType" || t.parent == "System.Enum" {
-                    return PDBType::Struct(type_name.to_string());
-                }
-            }
-            PDBType::Pointer(Box::new(PDBType::Struct(type_name.to_string())))
-        }
-    }
-}
-
-// i really should impl Deserialize myself to get better descriptions of the type,
-// or just convert to PDBType, etc before adding everything
-#[allow(unused)]
-#[derive(Debug, Deserialize)]
-pub struct REType {
-    #[serde(skip)]
-    name: String,
-    #[serde(default, deserialize_with = "parse_address_u64")]
-    address: u64,
-    #[serde(deserialize_with = "parse_address_u32")]
-    crc: u32,
-    #[serde(default, deserialize_with = "deserialize_fields")]
-    fields: HashMap<String, REField>,
-    #[serde(deserialize_with = "parse_address_u64")]
-    fqn: u64,
-    #[serde(default)]
-    is_generic_type: bool,
-    #[serde(default)]
-    is_generic_type_definition: bool,
-    #[serde(default, deserialize_with = "deserialize_methods")]
-    methods: HashMap<String, REMethod>,
-    #[serde(default)]
-    name_hierarchy: Vec<String>,
-    #[serde(default)]
-    properties: HashMap<String, REProperty>,
-    #[serde(deserialize_with = "parse_address_u32")]
-    #[serde(default)]
-    size: u32,
-    #[serde(default)]
-    parent: String,
-}
-
-impl REType {
-    fn is_enum_or_value_type(&self) -> bool {
-        self.parent.as_str() == "System.Enum" || self.parent.as_str() == "System.ValueType"
-    }
-
-    fn get_field_offset(&self, field: &REField) -> u64 {
-        if self.is_enum_or_value_type() {
-            field.offset_from_fieldptr as u64
-        } else {
-            field.offset_from_base as u64
-        }
-    }
-
-    fn get_own_struct_fields(
-        &self,
-        il2cpp: &Il2Cpp,
-        inherited_name_prefix: Option<&str>,
-        include_static: bool,
-    ) -> Vec<StructField> {
-        let mut struct_fields = vec![];
-        for (f_name, field) in &self.fields {
-            if !include_static && field.flags.contains("Static") {
-                continue;
-            }
-
-            let ty = get_pdb_type(&field.r#type, il2cpp);
-            let name = inherited_name_prefix
-                .map(|prefix| format!("{prefix}__{f_name}"))
-                .unwrap_or_else(|| f_name.clone());
-            let sf = StructField {
-                ty,
-                name,
-                offset: self.get_field_offset(field),
-                is_static: field.flags.contains("Static"),
-            };
-            struct_fields.push(sf);
-        }
-        struct_fields
-    }
-
-    pub fn get_struct_fields(&self, il2cpp: &Il2Cpp) -> Result<(Vec<StructField>, usize)> {
-        let mut struct_fields = vec![];
-        let mut inherited_fields_added = 0;
-
-        if !self.is_enum_or_value_type() {
-            let mut ancestors = vec![];
-            let mut parent_name = self.parent.as_str();
-            let mut seen = HashSet::new();
-
-            while !parent_name.is_empty()
-                && parent_name != "System.ValueType"
-                && parent_name != "System.Enum"
-                && seen.insert(parent_name.to_string())
-            {
-                let Some(parent) = il2cpp.get(parent_name) else {
-                    break;
-                };
-                ancestors.push(parent);
-                parent_name = parent.parent.as_str();
-            }
-
-            ancestors.reverse();
-            for ancestor in ancestors {
-                let prefix = format!("__base_{}", sanitize_member_prefix(&ancestor.name));
-                let mut fields = ancestor.get_own_struct_fields(il2cpp, Some(&prefix), false);
-                inherited_fields_added += fields.len();
-                struct_fields.append(&mut fields);
-            }
-        }
-
-        struct_fields.append(&mut self.get_own_struct_fields(il2cpp, None, true));
-        struct_fields.sort_by_key(|f| f.offset);
-        Ok((struct_fields, inherited_fields_added))
-    }
-
-    pub fn to_pdb_type(&self) -> Result<PDBType> {
-        let is_enum = self.parent == "System.Enum";
-        let is_value_type = self.parent == "System.ValueType";
-        //let is_array = self.parent == "System.Array";
-        let t = match self.name.as_str() {
-            "System.Boolean" => PDBType::SimpleType(SimpleTypeKind::Boolean8),
-            "System.SByte" => PDBType::SimpleType(SimpleTypeKind::SByte),
-            "System.Int16" => PDBType::SimpleType(SimpleTypeKind::Int16),
-            "System.Int32" => PDBType::SimpleType(SimpleTypeKind::Int32),
-            "System.Int64" => PDBType::SimpleType(SimpleTypeKind::Int64),
-            "System.Byte" => PDBType::SimpleType(SimpleTypeKind::Byte),
-            "System.UInt16" => PDBType::SimpleType(SimpleTypeKind::UInt16),
-            "System.UInt32" => PDBType::SimpleType(SimpleTypeKind::UInt32),
-            "System.UInt64" => PDBType::SimpleType(SimpleTypeKind::UInt64),
-            "System.Single" => PDBType::SimpleType(SimpleTypeKind::Float32),
-            "System.Double" => PDBType::SimpleType(SimpleTypeKind::Float64),
-            "System.Char" => PDBType::SimpleType(SimpleTypeKind::WideCharacter),
-            "System.Void" => PDBType::SimpleType(SimpleTypeKind::Void),
-            "System.Guid" => {
-                PDBType::ConstantArray(Box::new(PDBType::SimpleType(SimpleTypeKind::Byte)), 16)
-            }
-            _ => {
-                if is_enum || is_value_type {
-                    PDBType::Struct(self.name.to_string())
-                } else {
-                    PDBType::Pointer(Box::new(PDBType::Struct(self.name.to_string())))
-                }
-            } //_ => bail!("Unmatched type"),
-        };
-        Ok(t)
-    }
-}
-
-#[allow(unused)]
-#[derive(Debug, Deserialize)]
-
-pub struct REField {
-    #[serde(skip)]
-    name: String,
-    id: u32,
-    init_data_index: u32,
-    #[serde(deserialize_with = "parse_address_u32")]
-    offset_from_base: u32,
-    #[serde(deserialize_with = "parse_address_u32")]
-    offset_from_fieldptr: u32,
-    r#type: String,
-    #[serde(default)]
-    flags: String,
-}
-
-pub fn to_pdb_type(name: &str, parent: &str) -> Result<PDBType> {
-    let is_enum = parent == "System.Enum";
-    let is_value_type = parent == "System.ValueType";
-    let t = match name {
-        "System.Boolean" => PDBType::SimpleType(SimpleTypeKind::Boolean8),
-        "System.SByte" => PDBType::SimpleType(SimpleTypeKind::SByte),
-        "System.Int16" => PDBType::SimpleType(SimpleTypeKind::Int16),
-        "System.Int32" => PDBType::SimpleType(SimpleTypeKind::Int32),
-        "System.Int64" => PDBType::SimpleType(SimpleTypeKind::Int64),
-        "System.Byte" => PDBType::SimpleType(SimpleTypeKind::Byte),
-        "System.UInt16" => PDBType::SimpleType(SimpleTypeKind::UInt16),
-        "System.UInt32" => PDBType::SimpleType(SimpleTypeKind::UInt32),
-        "System.UInt64" => PDBType::SimpleType(SimpleTypeKind::UInt64),
-        "System.Single" => PDBType::SimpleType(SimpleTypeKind::Float32),
-        "System.Double" => PDBType::SimpleType(SimpleTypeKind::Float64),
-        "System.Char" => PDBType::SimpleType(SimpleTypeKind::WideCharacter),
-        "System.Void" => PDBType::SimpleType(SimpleTypeKind::Void),
-        "System.Guid" => {
-            PDBType::ConstantArray(Box::new(PDBType::SimpleType(SimpleTypeKind::Byte)), 16)
-        }
-        _ => {
-            if is_enum || is_value_type {
-                PDBType::Struct(name.to_string())
-            } else {
-                PDBType::Pointer(Box::new(PDBType::Struct(name.to_string())))
-            }
-        } //_ => bail!("Unmatched type"),
-    };
-    Ok(t)
-}
-
-#[allow(unused)]
-#[derive(Debug, Deserialize)]
-pub struct REMethod {
-    #[serde(skip)]
-    name: String,
-    flags: Option<String>,
-    #[serde(deserialize_with = "parse_address_u64")]
-    function: u64,
-    id: u32,
-    #[serde(default)]
-    impl_flags: String,
-    invoke_id: u32,
-    params: Option<Vec<REParam>>,
-    returns: Option<REParam>,
-    vtable_index: Option<u32>,
-}
-
-impl REMethod {
-    pub fn symbol_name(&self, r#type: &REType) -> String {
-        format!("{}::{}", r#type.name, self.name)
-    }
-    pub fn signature(&self, r#type: &REType) -> String {
-        let params = self
-            .params
-            .as_ref()
-            .map(|p| {
-                let mut params = String::new();
-                for (i, param) in p.iter().enumerate() {
-                    params.push_str(&param.r#type);
-                    if !param.name.is_empty() {
-                        params.push(' ');
-
-                        params.push_str(&param.name);
-                    }
-                    if i + 1 != p.len() {
-                        params.push(',');
-                    }
-                }
-                params
-            })
-            .unwrap_or("".to_string());
-        let signature = format!("{}({})", self.symbol_name(r#type), params);
-        signature
-    }
-
-    pub fn get_pdb_function(&self, class: Option<&str>, il2cpp: &Il2Cpp) -> PDBFunction {
-        let ret_type = self
-            .returns
-            .as_ref()
-            .and_then(|f| il2cpp.get(&f.r#type))
-            .and_then(|t| t.to_pdb_type().ok())
-            // this never really happens
-            .unwrap_or_else(|| PDBType::SimpleType(SimpleTypeKind::Void));
-
-        // vmctx passed in here
-        let mut param_types = vec![PDBType::Pointer(Box::new(PDBType::SimpleType(
-            SimpleTypeKind::Void,
-        )))];
-
-        if self.impl_flags.contains("HasThis") {
-            if let Some(class_name) = class {
-                param_types.push(PDBType::Pointer(Box::new(PDBType::Struct(
-                    class_name.to_string(),
-                ))));
-            }
-        }
-
-        if let Some(params) = &self.params {
-            for param in params {
-                param_types.push(get_pdb_type(&param.r#type, il2cpp));
-                /*let pdb_type = il2cpp
-                    .get(&param.r#type)
-                    .and_then(|t| t.to_pdb_type().ok())
-                    .unwrap_or_else(|| PDBType::SimpleType(SimpleTypeKind::Void));
-                param_types.push(pdb_type);*/
-            }
-        }
-
-        let cconv = CallingConvention::NearFast;
-
-        //let class_type = class.map(|x| PDBType::Struct(x.to_string()));
-        //PDBFunction::new(ret_type, &param_types, class_type, cconv)
-        PDBFunction::new_ex(ret_type, param_types, None, cconv)
-    }
-}
-
-#[allow(unused)]
-#[derive(Debug, Deserialize)]
-
-pub struct REParam {
-    name: String,
-    r#type: String,
-}
-
-#[allow(unused)]
-#[derive(Debug, Deserialize)]
-
-pub struct REProperty {
-    #[serde(skip)]
-    name: String,
-    getter: String,
-    id: u32,
-    setter: String,
-}
-
-pub type Il2Cpp = HashMap<String, REType>;
-
-fn sanitize_member_prefix(name: &str) -> String {
-    name.chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || ch == '_' {
-                ch
-            } else {
-                '_'
-            }
-        })
-        .collect()
-}
-
-fn parse_enum_value(raw: Option<&str>, previous_value: Option<u64>) -> Option<(u64, bool)> {
-    let Some(raw) = raw else {
-        return Some((
-            previous_value.map(|v| v.wrapping_add(1)).unwrap_or(0),
-            false,
-        ));
-    };
-
-    let raw = raw.trim();
-    let raw = raw.trim_end_matches(['u', 'U']);
-
-    if let Some(hex) = raw.strip_prefix("0x").or_else(|| raw.strip_prefix("0X")) {
-        let value = u64::from_str_radix(hex, 16).ok()?;
-        return Some((value, value > i32::MAX as u64));
-    }
-
-    if raw.starts_with('-') {
-        let value = raw.parse::<i64>().ok()?;
-        return Some((value as u64, false));
-    }
-
-    let value = raw.parse::<u64>().ok()?;
-    Some((value, value > i32::MAX as u64))
-}
-
-fn load_enum_map(path: &Path) -> Result<EnumMap> {
-    let text = fs::read_to_string(path)?;
-    let namespace_regex = Regex::new(r"namespace\s+([A-Za-z0-9_:]+)\s*\{")?;
-    let enum_regex =
-        Regex::new(r"enum(?:\s+class)?\s+([A-Za-z0-9_]+)(?:\s*:\s*[A-Za-z0-9_:]+)?\s*\{")?;
-    let value_regex = Regex::new(r"^\s*([A-Za-z0-9_]+)\s*(?:=\s*([^,]+))?\s*,?\s*$")?;
-
-    let lines: Vec<&str> = text.lines().collect();
-    let mut enums = EnumMap::new();
-    let mut namespace_stack: Vec<String> = Vec::new();
-    let mut i = 0;
-
-    while i < lines.len() {
-        let line = lines[i];
-
-        if let Some(namespace_match) = namespace_regex.captures(line) {
-            namespace_stack.push(namespace_match[1].replace("::", "."));
-            i += 1;
-            continue;
-        }
-
-        if line.contains('}') && !line.contains("};") && !namespace_stack.is_empty() {
-            namespace_stack.pop();
-            i += 1;
-            continue;
-        }
-
-        if let Some(enum_match) = enum_regex.captures(line) {
-            let enum_name = enum_match[1].to_string();
-            let mut variants = Vec::new();
-            let mut previous_value = None;
-
-            i += 1;
-            while i < lines.len() {
-                let enum_line = lines[i];
-                if enum_line.contains("};") || enum_line.trim() == "}" {
-                    break;
-                }
-
-                if let Some(value_match) = value_regex.captures(enum_line) {
-                    if let Some((value, is_unsigned)) =
-                        parse_enum_value(value_match.get(2).map(|m| m.as_str()), previous_value)
-                    {
-                        previous_value = Some(value);
-                        variants.push(EnumVariant {
-                            name: value_match[1].to_string(),
-                            value,
-                            is_unsigned,
-                        });
-                    }
-                }
-
-                i += 1;
-            }
-
-            let mut type_name = namespace_stack.join(".");
-            if !type_name.is_empty() {
-                type_name.push('.');
-            }
-            type_name.push_str(&enum_name);
-            enums.insert(type_name, variants);
-        }
-
-        i += 1;
-    }
-
-    Ok(enums)
-}
-
-fn resolve_enum_path(args: &PdbArgs) -> Option<PathBuf> {
-    if let Some(path) = &args.enums {
-        return Some(PathBuf::from(path));
-    }
-
-    let candidate = PathBuf::from(&args.il2cpp)
-        .parent()
-        .map(|parent| parent.join("Enums_Internal.hpp"))?;
-    candidate.exists().then_some(candidate)
-}
 
 fn inheritance_depth(name: &str, il2cpp: &Il2Cpp) -> usize {
     let mut depth = 0;
@@ -624,59 +183,8 @@ fn inheritance_depth(name: &str, il2cpp: &Il2Cpp) -> usize {
     depth
 }
 
-pub fn parse_address_u64<'de, D>(deserializer: D) -> Result<u64, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let s = String::deserialize(deserializer)?;
-    let clean_str = s.trim_start_matches("0x");
-    u64::from_str_radix(clean_str, 16).map_err(serde::de::Error::custom)
-}
-
-pub fn parse_address_u32<'de, D>(deserializer: D) -> Result<u32, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let s = String::deserialize(deserializer)?;
-    let clean_str = s.trim_start_matches("0x");
-    u32::from_str_radix(clean_str, 16).map_err(serde::de::Error::custom)
-}
-
-fn deserialize_fields<'de, D>(deserializer: D) -> Result<HashMap<String, REField>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let mut map: HashMap<String, REField> = HashMap::deserialize(deserializer)?;
-    for (key, t_data) in map.iter_mut() {
-        t_data.name = key.clone();
-    }
-    Ok(map)
-}
-
-fn deserialize_methods<'de, D>(deserializer: D) -> Result<HashMap<String, REMethod>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let mut map: HashMap<String, REMethod> = HashMap::deserialize(deserializer)?;
-    for (key, t_data) in map.iter_mut() {
-        t_data.name = key.clone();
-    }
-    Ok(map)
-}
-
-fn deserialize_il2cpp<'de, D>(deserializer: D) -> Result<Il2Cpp, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let mut map: HashMap<String, REType> = HashMap::deserialize(deserializer)?;
-    for (key, t_data) in map.iter_mut() {
-        t_data.name = key.clone();
-    }
-    Ok(map)
-}
 
 // age, signature, guid
-
 fn get_pdb_info(args: &PdbArgs, pe: &PeFile64) -> Result<(u32, u32, [u8; 16])> {
     let mut age = 0;
     let mut guid = [0; 16];
@@ -812,17 +320,25 @@ fn add_types(
 
         // value types shouldnt have vtables in their structs
         // TODO: maybe i should add a boxed type with a vtable
-        if !virtual_methods.is_empty() && !is_value_type {
+        // If it's a managed object type
+        if !is_value_type {
+            // moove this into a get_vtable_struct
             // safe to unwrap here since the above filters by is_some
             virtual_methods.sort_by_key(|m| m.vtable_index.unwrap());
             let vtable_name = format!("{}__vtable", name);
             let mut vtable_fields = vec![];
+            vtable_fields.push(StructField {
+                ty: PDBType::Pointer(Box::new(PDBType::SimpleType(SimpleTypeKind::Void))),
+                name: "__type_definition".to_string(),
+                offset: 0,
+                is_static: false
+            });
             let mut max_vtable_size = 0;
             for method in &virtual_methods {
                 let v_idx = method.vtable_index.unwrap() as u64;
                 let pdb_func = method.get_pdb_function(Some(&name), il2cpp);
                 let func_ptr_type = PDBType::Pointer(Box::new(PDBType::Function(pdb_func)));
-                let offset = v_idx * 8;
+                let offset = v_idx * 8 + 8;
                 vtable_fields.push(StructField {
                     ty: func_ptr_type,
                     name: method.name.clone(),
@@ -837,10 +353,17 @@ fn add_types(
 
             let (mut main_struct_fields, inherited_fields_added) = t.get_struct_fields(il2cpp)?;
             stats.inherited_fields_added += inherited_fields_added;
+            // TODO: move this into a get_struct_fields
             main_struct_fields.push(StructField {
                 ty: PDBType::Pointer(Box::new(PDBType::Struct(vtable_name))),
                 name: "__vftable".to_string(),
                 offset: 0x0,
+                is_static: false,
+            });
+            main_struct_fields.push(StructField {
+                ty: PDBType::SimpleType(SimpleTypeKind::Int32),
+                name: "__ref_count".to_string(),
+                offset: 0x8,
                 is_static: false,
             });
             main_struct_fields.sort_by_key(|f| f.offset);
