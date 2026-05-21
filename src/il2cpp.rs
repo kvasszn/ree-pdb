@@ -114,17 +114,25 @@ impl REType {
         il2cpp: &Il2Cpp,
         inherited_name_prefix: Option<&str>,
         include_static: bool,
+        ida_rename_array: bool,
     ) -> Vec<StructField> {
         let mut struct_fields = vec![];
+        let is_array = self.parent == "System.Array";
         for (f_name, field) in &self.fields {
             if !include_static && field.flags.contains(&REFieldFlag::Static) {
                 continue;
             }
-
             let ty = get_pdb_type(&field.r#type, il2cpp);
+            let name = if ida_rename_array && is_array {
+                rename_ida_array(f_name)
+            } else {
+                f_name.to_string()
+            };
             let name = inherited_name_prefix
-                .map(|prefix| format!("{prefix}__{f_name}"))
+                .map(|prefix| format!("{prefix}__{name}"))
                 .unwrap_or_else(|| f_name.clone());
+            
+
             let sf = StructField {
                 ty,
                 name,
@@ -136,7 +144,7 @@ impl REType {
         struct_fields
     }
 
-    pub fn get_struct_fields(&self, il2cpp: &Il2Cpp) -> Result<(Vec<StructField>, usize)> {
+    pub fn get_struct_fields(&self, il2cpp: &Il2Cpp, ida_rename_array: bool) -> Result<(Vec<StructField>, usize)> {
         let mut struct_fields = vec![];
         let mut inherited_fields_added = 0;
 
@@ -160,13 +168,13 @@ impl REType {
             ancestors.reverse();
             for ancestor in ancestors {
                 let prefix = format!("__base_{}", sanitize_member_prefix(&ancestor.name));
-                let mut fields = ancestor.get_own_struct_fields(il2cpp, Some(&prefix), false);
+                let mut fields = ancestor.get_own_struct_fields(il2cpp, Some(&prefix), false, ida_rename_array);
                 inherited_fields_added += fields.len();
                 struct_fields.append(&mut fields);
             }
         }
 
-        struct_fields.append(&mut self.get_own_struct_fields(il2cpp, None, true));
+        struct_fields.append(&mut self.get_own_struct_fields(il2cpp, None, true, ida_rename_array));
         struct_fields.sort_by_key(|f| f.offset);
         Ok((struct_fields, inherited_fields_added))
     }
@@ -206,7 +214,7 @@ impl REType {
             })
     }
 
-    pub fn get_struct_vtable(&self, il2cpp: &Il2Cpp) -> Result<(u64, Vec<StructField>)> {
+    pub fn get_struct_vtable(&self, il2cpp: &Il2Cpp, ida_rename_array: bool) -> Result<(u64, Vec<StructField>)> {
         if !self.flags.contains(&RETypeFlag::ManagedVTable) {
             bail!("Type {} does not have a Managed VTable", self.name)
         }
@@ -221,7 +229,7 @@ impl REType {
         });
 
         for (vtable_index, method) in self.iter_vtable_methods(il2cpp) {
-            let pdb_func = method.get_pdb_function(Some(&self.name), il2cpp);
+            let pdb_func = method.get_pdb_function(Some(&self.name), il2cpp, ida_rename_array);
             let func_ptr_type = PDBType::Pointer(Box::new(PDBType::Function(pdb_func)));
             let offset = vtable_index as u64 * 8 + 8;
             vtable_fields.push(StructField {
@@ -237,35 +245,7 @@ impl REType {
     }
 
     pub fn to_pdb_type(&self) -> Result<PDBType> {
-        let is_enum = self.parent == "System.Enum";
-        let is_value_type = self.parent == "System.ValueType";
-        //let is_array = self.parent == "System.Array";
-        let t = match self.name.as_str() {
-            "System.Boolean" => PDBType::SimpleType(SimpleTypeKind::Boolean8),
-            "System.SByte" => PDBType::SimpleType(SimpleTypeKind::SByte),
-            "System.Int16" => PDBType::SimpleType(SimpleTypeKind::Int16),
-            "System.Int32" => PDBType::SimpleType(SimpleTypeKind::Int32),
-            "System.Int64" => PDBType::SimpleType(SimpleTypeKind::Int64),
-            "System.Byte" => PDBType::SimpleType(SimpleTypeKind::Byte),
-            "System.UInt16" => PDBType::SimpleType(SimpleTypeKind::UInt16),
-            "System.UInt32" => PDBType::SimpleType(SimpleTypeKind::UInt32),
-            "System.UInt64" => PDBType::SimpleType(SimpleTypeKind::UInt64),
-            "System.Single" => PDBType::SimpleType(SimpleTypeKind::Float32),
-            "System.Double" => PDBType::SimpleType(SimpleTypeKind::Float64),
-            "System.Char" => PDBType::SimpleType(SimpleTypeKind::WideCharacter),
-            "System.Void" => PDBType::SimpleType(SimpleTypeKind::Void),
-            "System.Guid" => {
-                PDBType::ConstantArray(Box::new(PDBType::SimpleType(SimpleTypeKind::Byte)), 16)
-            }
-            _ => {
-                if is_enum || is_value_type {
-                    PDBType::Struct(self.name.to_string())
-                } else {
-                    PDBType::Pointer(Box::new(PDBType::Struct(self.name.to_string())))
-                }
-            } //_ => bail!("Unmatched type"),
-        };
-        Ok(t)
+        to_pdb_type(&self.name, &self.parent)
     }
 }
 
@@ -390,14 +370,18 @@ impl REMethod {
     pub fn symbol_name(&self, r#type: &REType) -> String {
         format!("{}::{}", r#type.name, self.name)
     }
-    pub fn signature(&self, r#type: &REType) -> String {
+    pub fn signature(&self, r#type: &REType, ida_rename_array: bool) -> String {
         let params = self
             .params
             .as_ref()
             .map(|p| {
                 let mut params = String::new();
                 for (i, param) in p.iter().enumerate() {
-                    params.push_str(&param.r#type);
+                    if ida_rename_array {
+                        params.push_str(&rename_ida_array(&param.r#type));
+                    } else {
+                        params.push_str(&param.r#type);
+                    }
                     if !param.name.is_empty() {
                         params.push(' ');
 
@@ -414,7 +398,7 @@ impl REMethod {
         signature
     }
 
-    pub fn get_pdb_function(&self, class: Option<&str>, il2cpp: &Il2Cpp) -> PDBFunction {
+    pub fn get_pdb_function(&self, class: Option<&str>, il2cpp: &Il2Cpp, ida_rename_array: bool) -> PDBFunction {
         let ret_type = self
             .returns
             .as_ref()
@@ -431,14 +415,25 @@ impl REMethod {
         if self.impl_flags.contains(&REImplFlag::HasThis) {
             if let Some(class_name) = class {
                 param_types.push(PDBType::Pointer(Box::new(PDBType::Struct(
-                    class_name.to_string(),
+                    if ida_rename_array {
+                        rename_ida_array(&class_name)
+                    } else {
+                        class_name.to_string()
+                    }
                 ))));
             }
         }
 
         if let Some(params) = &self.params {
             for param in params {
-                param_types.push(get_pdb_type(&param.r#type, il2cpp));
+                param_types.push(get_pdb_type(
+                    &if ida_rename_array {
+                        let renamed = rename_ida_array(&param.r#type);
+                        renamed
+                    } else {
+                        param.r#type.clone()
+                    },
+                    il2cpp));
                 /*let pdb_type = il2cpp
                     .get(&param.r#type)
                     .and_then(|t| t.to_pdb_type().ok())
@@ -548,37 +543,13 @@ pub struct REProperty {
 // idk if this should be part of the REType, or something else
 // lowkirkenuenly i should rewrite this whole program
 pub fn get_pdb_type(type_name: &str, il2cpp: &Il2Cpp) -> PDBType {
-    match type_name {
-        "System.Boolean" => PDBType::SimpleType(SimpleTypeKind::Boolean8),
-        "System.SByte" => PDBType::SimpleType(SimpleTypeKind::SByte),
-        "System.Int16" => PDBType::SimpleType(SimpleTypeKind::Int16),
-        "System.Int32" => PDBType::SimpleType(SimpleTypeKind::Int32),
-        "System.Int64" => PDBType::SimpleType(SimpleTypeKind::Int64),
-        "System.Byte" => PDBType::SimpleType(SimpleTypeKind::Byte),
-        "System.UInt16" => PDBType::SimpleType(SimpleTypeKind::UInt16),
-        "System.UInt32" => PDBType::SimpleType(SimpleTypeKind::UInt32),
-        "System.UInt64" => PDBType::SimpleType(SimpleTypeKind::UInt64),
-        "System.Single" => PDBType::SimpleType(SimpleTypeKind::Float32),
-        "System.Double" => PDBType::SimpleType(SimpleTypeKind::Float64),
-        "System.Char" => PDBType::SimpleType(SimpleTypeKind::WideCharacter),
-        "System.Void" => PDBType::SimpleType(SimpleTypeKind::Void),
-        "System.Guid" => {
-            PDBType::ConstantArray(Box::new(PDBType::SimpleType(SimpleTypeKind::Byte)), 16)
-        }
-        _ => {
-            if let Some(t) = il2cpp.get(type_name) {
-                if t.parent == "System.ValueType" || t.parent == "System.Enum" {
-                    return PDBType::Struct(type_name.to_string());
-                }
-            }
-            PDBType::Pointer(Box::new(PDBType::Struct(type_name.to_string())))
-        }
-    }
+    il2cpp.get(type_name)
+        .and_then(|ty| {
+            to_pdb_type(type_name, &ty.parent).ok()
+        }).unwrap_or(PDBType::SimpleType(SimpleTypeKind::None))
 }
 
 pub fn to_pdb_type(name: &str, parent: &str) -> Result<PDBType> {
-    let is_enum = parent == "System.Enum";
-    let is_value_type = parent == "System.ValueType";
     let t = match name {
         "System.Boolean" => PDBType::SimpleType(SimpleTypeKind::Boolean8),
         "System.SByte" => PDBType::SimpleType(SimpleTypeKind::SByte),
@@ -593,16 +564,19 @@ pub fn to_pdb_type(name: &str, parent: &str) -> Result<PDBType> {
         "System.Double" => PDBType::SimpleType(SimpleTypeKind::Float64),
         "System.Char" => PDBType::SimpleType(SimpleTypeKind::WideCharacter),
         "System.Void" => PDBType::SimpleType(SimpleTypeKind::Void),
-        "System.Guid" => {
-            PDBType::ConstantArray(Box::new(PDBType::SimpleType(SimpleTypeKind::Byte)), 16)
-        }
+        /*"System.Guid" => {
+            //PDBType::ConstantArray(Box::new(PDBType::SimpleType(SimpleTypeKind::Byte)), 16)
+            PDBType::Struct(name.to_string())
+        }*/
         _ => {
-            if is_enum || is_value_type {
+            if parent == "System.ValueType" || parent == "System.Enum" {
                 PDBType::Struct(name.to_string())
+            } else if parent == "System.Array" {
+                PDBType::Pointer(Box::new(PDBType::Struct(name.to_string())))
             } else {
                 PDBType::Pointer(Box::new(PDBType::Struct(name.to_string())))
             }
-        } //_ => bail!("Unmatched type"),
+        }
     };
     Ok(t)
 }

@@ -12,6 +12,24 @@ pub fn sanitize_member_prefix(name: &str) -> String {
         .collect()
 }
 
+pub fn sanitize_struct_name(name: &str) -> String {
+    name.replace("[]", "_arr").replace(",", "_multi_")
+}
+
+pub fn rename_ida_array(name: &str) -> String {
+    let dim = 1 + name.matches(',').count();
+    let contained = array_contained_type(name);
+    if dim > 1 {
+        format!("{contained}__{dim}d_arr")
+    } else {
+        format!("{contained}__arr")
+    }
+}
+
+pub fn array_contained_type(name: &str) -> String {
+    name.replace(",", "").replace("[]", "")
+}
+
 
 pub fn parse_address_u64<'de, D>(deserializer: D) -> Result<u64, D::Error>
 where

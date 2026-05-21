@@ -324,14 +324,14 @@ fn add_types(
         // If it's a managed object type
         // Value Types
         if is_value_type {
-            let (struct_fields, inherited_fields_added) = t.get_struct_fields(il2cpp)?;
+            let (struct_fields, inherited_fields_added) = t.get_struct_fields(il2cpp, ida_rename_array)?;
             stats.inherited_fields_added += inherited_fields_added;
             pdb.insert_struct(&name, &struct_fields, t.size as u64)?;
             stats.structs_added += 1;
         }
         if !is_value_type && t.flags.contains(&RETypeFlag::ManagedVTable) {
             let vtable_name = format!("{}__vtable", &name);
-            let (vtable_size, vtable_fields) = t.get_struct_vtable(il2cpp)?;
+            let (vtable_size, vtable_fields) = t.get_struct_vtable(il2cpp, ida_rename_array)?;
 
             if verbose {
                 println!("Adding vtable {vtable_name}");
@@ -339,28 +339,46 @@ fn add_types(
             pdb.insert_struct(&vtable_name, &vtable_fields, vtable_size)?;
             stats.structs_added += 1;
 
-            let (mut main_struct_fields, inherited_fields_added) = t.get_struct_fields(il2cpp)?;
+            let (mut main_struct_fields, inherited_fields_added) = t.get_struct_fields(il2cpp, ida_rename_array)?;
             stats.inherited_fields_added += inherited_fields_added;
             // TODO: move this into a get_struct_fields
-            // Arrays different https://github.com/praydog/REFramework/blob/master/shared/sdk/regenny/dd2/via/ManagedObjectArray.hpp
             if t.parent == "System.Array" {
+
                 main_struct_fields.push(StructField {
-                    // uhhgghhghghghghghhghgh
-                    ty: PDBType::Pointer(Box::new(PDBType::Pointer(Box::new(PDBType::Struct(vtable_name))))),
-                    name: "objects".to_string(),
+                    ty: PDBType::Pointer(Box::new(PDBType::Struct(vtable_name))),
+                    name: "__vftable".to_string(),
                     offset: 0x0,
                     is_static: false,
                 });
                 main_struct_fields.push(StructField {
                     ty: PDBType::SimpleType(SimpleTypeKind::UInt32),
-                    name: "count".to_string(),
+                    name: "__ref_count".to_string(),
                     offset: 0x8,
                     is_static: false,
                 });
                 main_struct_fields.push(StructField {
+                    ty: PDBType::Pointer(Box::new(PDBType::SimpleType(SimpleTypeKind::Void))),
+                    name: "contained_type".to_string(),
+                    offset: 0x10,
+                    is_static: false,
+                });
+                main_struct_fields.push(StructField {
                     ty: PDBType::SimpleType(SimpleTypeKind::UInt32),
-                    name: "capacity".to_string(),
-                    offset: 0xc,
+                    name: "count".to_string(),
+                    offset: 0x18,
+                    is_static: false,
+                });
+                main_struct_fields.push(StructField {
+                    ty: PDBType::SimpleType(SimpleTypeKind::UInt32),
+                    name: "n".to_string(),
+                    offset: 0x1c,
+                    is_static: false,
+                });
+                let contained_type = get_pdb_type(&array_contained_type(&t.name), il2cpp);
+                main_struct_fields.push(StructField {
+                    ty: PDBType::ConstantArray(Box::new(contained_type), 0),
+                    name: "elements".to_string(),
+                    offset: 0x20,
                     is_static: false,
                 });
             } else {
@@ -380,15 +398,26 @@ fn add_types(
 
             main_struct_fields.sort_by_key(|f| f.offset);
             // Rename foo.bar[] types to foo.bar_arr for ida
-            if ida_rename_array {
-                pdb.insert_struct(&name.replace("[]", "__arr"), &main_struct_fields, t.size as u64)?;
+            if t.parent == "System.Array" {
+                pdb.insert_struct(&name, &main_struct_fields, 0x20)?;
+                if ida_rename_array {
+                    let fields = vec![
+                        StructField {
+                            ty: PDBType::Struct(name.to_string()),
+                            name: "inner".to_string(),
+                            offset: 0x0,
+                            is_static: false,
+                        }
+                    ];
+                    pdb.insert_struct(&rename_ida_array(name), &fields, 0x20)?;
+                }
             } else {
                 pdb.insert_struct(&name, &main_struct_fields, t.size as u64)?;
             }
             stats.structs_added += 1;
         } else {
             //println!("Adding normal struct {}", t.name);
-            let (struct_fields, inherited_fields_added) = t.get_struct_fields(il2cpp)?;
+            let (struct_fields, inherited_fields_added) = t.get_struct_fields(il2cpp, ida_rename_array)?;
             stats.inherited_fields_added += inherited_fields_added;
             pdb.insert_struct(&name, &struct_fields, t.size as u64)?;
             stats.structs_added += 1;
@@ -399,7 +428,7 @@ fn add_types(
         let t = &il2cpp[*name];
         for (_f_name, function) in &t.methods {
             if function.function != 0 {
-                let signature = function.signature(t);
+                let signature = function.signature(t, ida_rename_array);
                 if verbose {
                     println!("\tAdding function {}@{:x}", signature, function.function);
                 }
@@ -419,7 +448,7 @@ fn add_types(
                     stats.functions_mapped_by_fallback += 1;
                 }
 
-                let pdb_func = function.get_pdb_function(Some(&name), il2cpp);
+                let pdb_func = function.get_pdb_function(Some(&name), il2cpp, ida_rename_array);
                 let func_type = PDBType::Function(pdb_func);
                 let sym_name = function.symbol_name(t);
                 let mut param_names = vec![];
