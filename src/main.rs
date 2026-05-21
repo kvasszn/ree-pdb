@@ -9,18 +9,17 @@ use crate::util::*;
 use crate::il2cpp::*;
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashSet},
     fs,
-    path::{Path, PathBuf},
+    path::{PathBuf},
     time::Instant,
-    fmt::Display
 };
 
 use clap::Parser;
 use object::{Object, ObjectSection, read::pe::PeFile64};
 use pdb_wrapper::{
-    PDB, PDBEnumVariant, PDBFunction, PDBType, StructField,
-    pdb_meta::{CallingConvention, SimpleTypeKind},
+    PDB, PDBEnumVariant, PDBType, StructField,
+    pdb_meta::{SimpleTypeKind},
 };
 use anyhow::Result;
 use regex::Regex;
@@ -47,6 +46,8 @@ pub struct PdbArgs {
         help = "path to the output directory, e.g 'C:\\Program Files (x86)\\Steam\\steamapps\\common\\MonsterHunterWilds'. If unspecified, it will be written to the directory of the exe"
     )]
     output: Option<String>,
+    // TODO: potentially change defaut to runtime_il2cpp.pdb, some games have that as the entry that they
+    // look for instead of <GameName>.pdb
     #[arg(
         short,
         long,
@@ -83,6 +84,11 @@ pub struct PdbArgs {
         help = "prefix enum member names with the enum type name to avoid IDA enumerator-name collisions"
     )]
     ida_safe_enums: bool,
+    #[arg(
+        long,
+        help = "rename arrays to foo.bar__arr since IDA by default flattens foo.bar[] to foo_bar__"
+    )]
+    ida_rename_array: bool,
     #[arg(short, long)]
     verbose: bool,
     #[arg(
@@ -236,6 +242,7 @@ fn add_types(
     address_map: &AddressMap,
     fallback_addr_offset: u64,
     ida_safe_enums: bool,
+    ida_rename_array: bool,
     verbose: bool,
 ) -> Result<AddStats> {
     let mut stats = AddStats::default();
@@ -335,20 +342,49 @@ fn add_types(
             let (mut main_struct_fields, inherited_fields_added) = t.get_struct_fields(il2cpp)?;
             stats.inherited_fields_added += inherited_fields_added;
             // TODO: move this into a get_struct_fields
-            main_struct_fields.push(StructField {
-                ty: PDBType::Pointer(Box::new(PDBType::Struct(vtable_name))),
-                name: "__vftable".to_string(),
-                offset: 0x0,
-                is_static: false,
-            });
-            main_struct_fields.push(StructField {
-                ty: PDBType::SimpleType(SimpleTypeKind::Int32),
-                name: "__ref_count".to_string(),
-                offset: 0x8,
-                is_static: false,
-            });
+            // Arrays different https://github.com/praydog/REFramework/blob/master/shared/sdk/regenny/dd2/via/ManagedObjectArray.hpp
+            if t.parent == "System.Array" {
+                main_struct_fields.push(StructField {
+                    // uhhgghhghghghghghhghgh
+                    ty: PDBType::Pointer(Box::new(PDBType::Pointer(Box::new(PDBType::Struct(vtable_name))))),
+                    name: "objects".to_string(),
+                    offset: 0x0,
+                    is_static: false,
+                });
+                main_struct_fields.push(StructField {
+                    ty: PDBType::SimpleType(SimpleTypeKind::UInt32),
+                    name: "count".to_string(),
+                    offset: 0x8,
+                    is_static: false,
+                });
+                main_struct_fields.push(StructField {
+                    ty: PDBType::SimpleType(SimpleTypeKind::UInt32),
+                    name: "capacity".to_string(),
+                    offset: 0xc,
+                    is_static: false,
+                });
+            } else {
+                main_struct_fields.push(StructField {
+                    ty: PDBType::Pointer(Box::new(PDBType::Struct(vtable_name))),
+                    name: "__vftable".to_string(),
+                    offset: 0x0,
+                    is_static: false,
+                });
+                main_struct_fields.push(StructField {
+                    ty: PDBType::SimpleType(SimpleTypeKind::UInt32),
+                    name: "__ref_count".to_string(),
+                    offset: 0x8,
+                    is_static: false,
+                });
+            }
+
             main_struct_fields.sort_by_key(|f| f.offset);
-            pdb.insert_struct(&name, &main_struct_fields, t.size as u64)?;
+            // Rename foo.bar[] types to foo.bar_arr for ida
+            if ida_rename_array {
+                pdb.insert_struct(&name.replace("[]", "__arr"), &main_struct_fields, t.size as u64)?;
+            } else {
+                pdb.insert_struct(&name, &main_struct_fields, t.size as u64)?;
+            }
             stats.structs_added += 1;
         } else {
             //println!("Adding normal struct {}", t.name);
@@ -473,6 +509,7 @@ fn main() -> Result<()> {
         &address_map,
         args.address,
         args.ida_safe_enums,
+        args.ida_rename_array,
         args.verbose,
     )?;
     println!(

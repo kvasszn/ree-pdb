@@ -189,7 +189,7 @@ impl REType {
         ancestors.into_iter()
             .flat_map(|class| class.methods.values())
             .filter_map(move |method| {
-                if !method.flags.contains(&REMethodFlag::Static) {
+                if method.flags.contains(&REMethodFlag::Static) {
                     return None
                 }
                 if !method.flags.contains(&REMethodFlag::Virtual)
