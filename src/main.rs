@@ -1,12 +1,14 @@
 pub mod il2cpp;
 pub mod enums;
 pub mod util;
+pub mod traversal;
 
 use crate::enums::EnumMap;
 use crate::enums::load_enum_map;
 use crate::enums::resolve_enum_path;
 use crate::util::*;
 use crate::il2cpp::*;
+use crate::traversal::*;
 
 use std::{
     collections::{HashSet},
@@ -84,11 +86,6 @@ pub struct PdbArgs {
         help = "prefix enum member names with the enum type name to avoid IDA enumerator-name collisions"
     )]
     ida_safe_enums: bool,
-    #[arg(
-        long,
-        help = "rename arrays to foo.bar__arr since IDA by default flattens foo.bar[] to foo_bar__"
-    )]
-    ida_rename_array: bool,
     #[arg(short, long)]
     verbose: bool,
     #[arg(
@@ -169,27 +166,6 @@ struct AddStats {
     functions_skipped_outside_sections: usize,
 }
 
-
-fn inheritance_depth(name: &str, il2cpp: &Il2Cpp) -> usize {
-    let mut depth = 0;
-    let mut current = name;
-    let mut seen = HashSet::new();
-
-    while seen.insert(current.to_string()) {
-        let Some(ty) = il2cpp.get(current) else {
-            break;
-        };
-        if ty.parent.is_empty() {
-            break;
-        }
-        depth += 1;
-        current = ty.parent.as_str();
-    }
-
-    depth
-}
-
-
 // age, signature, guid
 fn get_pdb_info(args: &PdbArgs, pe: &PeFile64) -> Result<(u32, u32, [u8; 16])> {
     let mut age = 0;
@@ -235,114 +211,84 @@ fn resolve_function_address(
         })
 }
 
-fn add_types(
+fn add_types_in_order(
     pdb: &mut PDB,
     il2cpp: &Il2Cpp,
     enum_map: &EnumMap,
     address_map: &AddressMap,
+    filter: Option<String>,
     fallback_addr_offset: u64,
     ida_safe_enums: bool,
-    ida_rename_array: bool,
     verbose: bool,
 ) -> Result<AddStats> {
     let mut stats = AddStats::default();
-    let mut type_names: Vec<&String> = il2cpp.keys().filter(|name| !name.is_empty()).collect();
-    type_names.sort_by(|a, b| {
-        inheritance_depth(a.as_str(), il2cpp)
-            .cmp(&inheritance_depth(b.as_str(), il2cpp))
-            .then_with(|| a.cmp(b))
-    });
-
-    if il2cpp.contains_key("") {
-        println!("[INFO] Skipping \"\" (empty)");
-    }
-
-    for name in &type_names {
-        let t = &il2cpp[*name];
-        if t.parent != "System.Enum" {
-            continue;
-        }
-
-        if verbose {
-            println!("Adding Type {name}");
-        }
-
-        if let Some(val_field) = t.fields.get("value__") {
-            let underlying_type = get_pdb_type(&val_field.r#type, il2cpp);
-            if let Some(variants) = enum_map
-                .get(name.as_str())
-                .filter(|variants| !variants.is_empty())
-            {
-                if verbose {
-                    println!("[INFO] Adding Enum {}", name);
-                }
-                let variants: Vec<PDBEnumVariant> = variants
-                    .iter()
-                    .map(|variant| PDBEnumVariant {
-                        name: if ida_safe_enums {
-                            format!(
-                                "{}__{}",
-                                sanitize_member_prefix(name),
-                                sanitize_member_prefix(&variant.name)
-                            )
-                        } else {
-                            variant.name.clone()
-                        },
-                        value: variant.value,
-                        is_unsigned: variant.is_unsigned,
-                    })
-                    .collect();
-                pdb.insert_enum(name, &underlying_type, &variants)?;
-                stats.enums_added += 1;
-            } else {
-                let fields = vec![StructField {
-                    ty: underlying_type,
-                    name: "value__".to_string(),
-                    offset: 0,
-                    is_static: false,
-                }];
-                pdb.insert_struct(name, &fields, 4)?;
-                stats.structs_added += 1;
+    let mut visited = HashSet::new();
+    visited.insert("");
+    let filter = filter.map(|s| Regex::new(&s).expect("invalid regex"));
+    visit_in_order(il2cpp, &mut visited, &filter, |ty| {
+        let name = &ty.name;
+        if ty.is_enum() {
+            if verbose {
+                println!("Adding Type {name}");
             }
-        }
-    }
 
-    for name in &type_names {
-        let t = &il2cpp[*name];
-        if t.parent == "System.Enum" {
-            continue;
-        }
-
-        if verbose {
-            println!("Adding Type {name}");
-        }
-
-        let is_value_type = t.parent.as_str() == "System.ValueType";
-
-        // value types shouldnt have vtables in their structs
-        // TODO: maybe i should add a boxed type with a vtable
-        // If it's a managed object type
-        // Value Types
-        if is_value_type {
-            let (struct_fields, inherited_fields_added) = t.get_struct_fields(il2cpp, ida_rename_array)?;
+            if let Some(val_field) = ty.fields.get("value__") {
+                let underlying_type = get_pdb_type(&val_field.r#type, il2cpp);
+                if let Some(variants) = enum_map
+                    .get(name.as_str())
+                        .filter(|variants| !variants.is_empty())
+                {
+                    if verbose {
+                        println!("[INFO] Adding Enum {}", name);
+                    }
+                    let variants: Vec<PDBEnumVariant> = variants
+                        .iter()
+                        .map(|variant| PDBEnumVariant {
+                            name: if ida_safe_enums {
+                                format!(
+                                    "{}__{}",
+                                    sanitize_member_prefix(name),
+                                    sanitize_member_prefix(&variant.name)
+                                )
+                            } else {
+                                variant.name.clone()
+                            },
+                            value: variant.value,
+                            is_unsigned: variant.is_unsigned,
+                        })
+                    .collect();
+                    pdb.insert_enum(name, &underlying_type, &variants).unwrap();
+                    stats.enums_added += 1;
+                } else {
+                    let fields = vec![StructField {
+                        ty: underlying_type,
+                        name: "value__".to_string(),
+                        offset: 0,
+                        is_static: false,
+                    }];
+                    pdb.insert_struct(name, &fields, 4).unwrap();
+                    stats.structs_added += 1;
+                }
+            }
+        } else if ty.is_value_type() {
+            let (struct_fields, inherited_fields_added) = ty.get_struct_fields(il2cpp).unwrap();
             stats.inherited_fields_added += inherited_fields_added;
-            pdb.insert_struct(&name, &struct_fields, t.size as u64)?;
+            pdb.insert_struct(&name, &struct_fields, ty.size as u64).unwrap();
             stats.structs_added += 1;
-        }
-        if !is_value_type && t.flags.contains(&RETypeFlag::ManagedVTable) {
+        } else if ty.flags.contains(&RETypeFlag::ManagedVTable) {
             let vtable_name = format!("{}__vtable", &name);
-            let (vtable_size, vtable_fields) = t.get_struct_vtable(il2cpp, ida_rename_array)?;
+            let (vtable_size, vtable_fields) = ty.get_struct_vtable(il2cpp).unwrap();
 
             if verbose {
                 println!("Adding vtable {vtable_name}");
             }
-            pdb.insert_struct(&vtable_name, &vtable_fields, vtable_size)?;
+            pdb.insert_struct(&vtable_name, &vtable_fields, vtable_size).unwrap();
             stats.structs_added += 1;
 
-            let (mut main_struct_fields, inherited_fields_added) = t.get_struct_fields(il2cpp, ida_rename_array)?;
+            let (mut main_struct_fields, inherited_fields_added) = ty.get_struct_fields(il2cpp).unwrap();
             stats.inherited_fields_added += inherited_fields_added;
             // TODO: move this into a get_struct_fields
-            if t.parent == "System.Array" {
+            if ty.parent == "System.Array" {
 
                 main_struct_fields.push(StructField {
                     ty: PDBType::Pointer(Box::new(PDBType::Struct(vtable_name))),
@@ -374,7 +320,7 @@ fn add_types(
                     offset: 0x1c,
                     is_static: false,
                 });
-                let contained_type = get_pdb_type(&array_contained_type(&t.name), il2cpp);
+                let contained_type = get_pdb_type(&array_contained_type(&ty.name), il2cpp);
                 main_struct_fields.push(StructField {
                     ty: PDBType::ConstantArray(Box::new(contained_type), 0),
                     name: "elements".to_string(),
@@ -397,38 +343,24 @@ fn add_types(
             }
 
             main_struct_fields.sort_by_key(|f| f.offset);
-            // Rename foo.bar[] types to foo.bar_arr for ida
-            if t.parent == "System.Array" {
-                pdb.insert_struct(&name, &main_struct_fields, 0x20)?;
-                if ida_rename_array {
-                    let fields = vec![
-                        StructField {
-                            ty: PDBType::Struct(name.to_string()),
-                            name: "inner".to_string(),
-                            offset: 0x0,
-                            is_static: false,
-                        }
-                    ];
-                    pdb.insert_struct(&rename_ida_array(name), &fields, 0x20)?;
-                }
+            if ty.parent == "System.Array" {
+                pdb.insert_struct(&name, &main_struct_fields, 0x20).unwrap();
             } else {
-                pdb.insert_struct(&name, &main_struct_fields, t.size as u64)?;
+                pdb.insert_struct(&name, &main_struct_fields, ty.size as u64).unwrap();
             }
             stats.structs_added += 1;
         } else {
             //println!("Adding normal struct {}", t.name);
-            let (struct_fields, inherited_fields_added) = t.get_struct_fields(il2cpp, ida_rename_array)?;
+            let (struct_fields, inherited_fields_added) = ty.get_struct_fields(il2cpp).unwrap();
             stats.inherited_fields_added += inherited_fields_added;
-            pdb.insert_struct(&name, &struct_fields, t.size as u64)?;
+            pdb.insert_struct(&name, &struct_fields, ty.size as u64).unwrap();
             stats.structs_added += 1;
         }
-    }
 
-    for name in &type_names {
-        let t = &il2cpp[*name];
-        for (_f_name, function) in &t.methods {
+
+        for (_f_name, function) in &ty.methods {
             if function.function != 0 {
-                let signature = function.signature(t, ida_rename_array);
+                let signature = function.signature(ty);
                 if verbose {
                     println!("\tAdding function {}@{:x}", signature, function.function);
                 }
@@ -448,9 +380,9 @@ fn add_types(
                     stats.functions_mapped_by_fallback += 1;
                 }
 
-                let pdb_func = function.get_pdb_function(Some(&name), il2cpp, ida_rename_array);
+                let pdb_func = function.get_pdb_function(Some(&name), il2cpp);
                 let func_type = PDBType::Function(pdb_func);
-                let sym_name = function.symbol_name(t);
+                let sym_name = function.symbol_name(ty);
                 let mut param_names = vec![];
                 param_names.push("vmctx");
                 if function.impl_flags.contains(&REImplFlag::HasThis) {
@@ -474,12 +406,12 @@ fn add_types(
                     &sym_name,
                     Some(&func_type),
                     &param_names,
-                )?;
+                ).unwrap();
                 stats.functions_added += 1;
                 //pdb.insert_function(1, offset_addr, &function.name, Some(&func_type))?;
             }
         }
-    }
+    });
 
     Ok(stats)
 }
@@ -490,13 +422,8 @@ fn main() -> Result<()> {
     println!("[INFO] Loading il2cpp from {}", args.il2cpp);
     let il2cpp = std::fs::read_to_string(&args.il2cpp)?;
     let mut deserializer = serde_json::Deserializer::from_str(&il2cpp);
-    let mut il2cpp = deserialize_il2cpp(&mut deserializer)?;
+    let il2cpp = deserialize_il2cpp(&mut deserializer)?;
 
-    if let Some(re) = &args.filter {
-        let regex = Regex::new(&re)?;
-        println!("[INFO] Filtering for \"{re}\"");
-        il2cpp.retain(|k, _| regex.is_match(&k));
-    }
     println!("[INFO] Finished loading il2cpp");
 
     let enum_map = if let Some(enum_path) = resolve_enum_path(&args) {
@@ -531,14 +458,14 @@ fn main() -> Result<()> {
     );
     let start_time = Instant::now();
     println!("[INFO] Adding {} il2cpp types", il2cpp.len());
-    let stats = add_types(
+    let stats = add_types_in_order(
         &mut pdb,
         &il2cpp,
         &enum_map,
         &address_map,
+        args.filter,
         args.address,
         args.ida_safe_enums,
-        args.ida_rename_array,
         args.verbose,
     )?;
     println!(
