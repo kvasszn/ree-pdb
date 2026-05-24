@@ -3,7 +3,7 @@ use regex::Regex;
 
 use crate::il2cpp::{Il2Cpp, REType};
 
-pub fn visit_in_order<'a, F>(il2cpp: &'a Il2Cpp, visited: &'a mut HashSet<&'a str>, filter: &Option<Regex>, mut emit: F)
+pub fn visit_in_order<'a, F>(il2cpp: &'a Il2Cpp, visited: &'a mut HashSet<&'a str>, filter: &Option<Regex>, mut emit: F) -> HashSet<&'a str>
 where
     F: FnMut(&'a REType),
 {
@@ -15,6 +15,7 @@ where
         }
         visit(name, il2cpp, visited, &mut emit);
     }
+    visited.clone()
 }
 
 fn visit<'a, F>(

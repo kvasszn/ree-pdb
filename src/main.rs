@@ -2,13 +2,14 @@ pub mod il2cpp;
 pub mod enums;
 pub mod util;
 pub mod traversal;
+pub mod analyzer;
 
 use crate::enums::EnumMap;
 use crate::enums::load_enum_map;
-use crate::enums::resolve_enum_path;
 use crate::util::*;
 use crate::il2cpp::*;
 use crate::traversal::*;
+use crate::analyzer::Analyzer;
 
 use std::{
     collections::{HashSet},
@@ -94,6 +95,17 @@ pub struct PdbArgs {
         help = "fallback base address for symbols that cannot be mapped through the PE section table"
     )]
     address: u64,
+}
+
+pub fn resolve_enum_path(args: &PdbArgs) -> Option<PathBuf> {
+    if let Some(path) = &args.enums {
+        return Some(PathBuf::from(path));
+    }
+
+    let candidate = PathBuf::from(&args.il2cpp)
+        .parent()
+        .map(|parent| parent.join("Enums_Internal.hpp"))?;
+    candidate.exists().then_some(candidate)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -214,6 +226,7 @@ fn resolve_function_address(
 fn add_types_in_order(
     pdb: &mut PDB,
     il2cpp: &Il2Cpp,
+    exe: &[u8],
     enum_map: &EnumMap,
     address_map: &AddressMap,
     filter: Option<String>,
@@ -225,7 +238,7 @@ fn add_types_in_order(
     let mut visited = HashSet::new();
     visited.insert("");
     let filter = filter.map(|s| Regex::new(&s).expect("invalid regex"));
-    visit_in_order(il2cpp, &mut visited, &filter, |ty| {
+    let added = visit_in_order(il2cpp, &mut visited, &filter, |ty| {
         let name = &ty.name;
         if ty.is_enum() {
             if verbose {
@@ -413,6 +426,27 @@ fn add_types_in_order(
         }
     });
 
+    let analyzer = Analyzer::new(il2cpp, exe)?;
+    let singletons = analyzer.find_singletons();
+    println!("{:#?}", singletons);
+    for (ty_name, singleton_ptr) in singletons {
+        if added.contains(&ty_name.as_str()) {
+            let Some((pdb_address, _used_fallback)) =
+                resolve_function_address(address_map, singleton_ptr, fallback_addr_offset)
+                else {
+                    stats.functions_skipped_outside_sections += 1;
+                    if verbose {
+                        println!(
+                            "\tSkipping singleton {}@{:x}: address is outside PE sections",
+                            ty_name, singleton_ptr 
+                        );
+                    }
+                    continue;
+                };
+            let ty = PDBType::Pointer(Box::new(PDBType::Struct(ty_name.clone())));
+            pdb.insert_global(&ty_name, pdb_address.section, pdb_address.offset, Some(&ty))?;
+        }
+    }
     Ok(stats)
 }
 
@@ -457,10 +491,12 @@ fn main() -> Result<()> {
         address_map.sections.len()
     );
     let start_time = Instant::now();
+
     println!("[INFO] Adding {} il2cpp types", il2cpp.len());
     let stats = add_types_in_order(
         &mut pdb,
         &il2cpp,
+        &data,
         &enum_map,
         &address_map,
         args.filter,

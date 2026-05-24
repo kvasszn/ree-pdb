@@ -3,9 +3,17 @@ name = "ree-pdb"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "analyze"
+path = "src/bin/analyze.rs"
+
 [dependencies]
 anyhow = "1.0.102"
 clap = { version = "4.6.0", features = ["derive"] }
+iced-x86 = "1.21.0"
 ms-pdb = "0.1.22"
 object = "0.38.1"
 pdb_wrapper = { git = "https://github.com/kvasszn/pdb_wrapper", version = "0.2.2" }

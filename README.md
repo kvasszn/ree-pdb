@@ -53,26 +53,29 @@ I developed this on windows but the llvm tools are cross platform so I'll releas
 Then just git clone and build. If you don't build in release it will be really really slow because rust 🚀. Other than that it's blazingly fast.
 ```
 git clone https://github.com/kvasszn/ree-pdb.git
-cargo build --release
+cargo build --release --bin ree-pdb
 ```
 
 ## TODO
-- [ ] topological dependancy checking
+- [x] topological dependancy checking
     - this should make leaner pdbs and potentially be faster
 - [x] types
 - [x] symbols/functions
 - [x] vtables (might be weird at times idk)
 - [x] enums
-- [ ] global singletons
+- [x] global singletons
 - [ ] static fields/literals
     - this would be nice since it wouldn't require parsing `Enums_Internal.hpp` anymore if done right
     - could probably convert some code for adding enums for this
+    - static fields can be done with the same method as managed singletons
+- [ ] reflection methods and properties
+- [ ] it would be nice to try and statically analyze the binary to fill in types using simple getters/setters for native types without reflected fields
+    - static fields are easy, non-static fields are harder
 - [ ] proper value type handling (kinda done maybe)
 - [ ] flags as additional info
 - [ ] verifiying that things actually work in different things. I wrote this 10 min ago but wtf does this even mean, probably different tools/games
 - [ ] rewrite with microsoft's [ms_pdb](https://github.com/microsoft/pdb-rs) as a backend instead of llvm + pdb_wrapper
     - structs can mostly be done with this, but I've looked into it and some things like public symbols don't have great support
-- [ ] it would be nice to try and statically analyze the binary to fill in types using simple getters/setters for native types without reflected fields
 - [ ] system to add additional custom struct definitions (i.e you reverse something yourself and want to add it to the pdb)
 - [ ] comments on things in the pdb? maybe for functions that people can add similar to the above thing
 - [ ] script to fixup the IAT in dumped exes using the non-dumped exe

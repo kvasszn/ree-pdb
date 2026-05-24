@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 use std::fs;
-use std::path::{Path, PathBuf};
-use crate::PdbArgs;
+use std::path::Path;
 
 use anyhow::Result;
 use regex::Regex;
@@ -107,15 +106,4 @@ pub fn load_enum_map(path: &Path) -> Result<EnumMap> {
     }
 
     Ok(enums)
-}
-
-pub fn resolve_enum_path(args: &PdbArgs) -> Option<PathBuf> {
-    if let Some(path) = &args.enums {
-        return Some(PathBuf::from(path));
-    }
-
-    let candidate = PathBuf::from(&args.il2cpp)
-        .parent()
-        .map(|parent| parent.join("Enums_Internal.hpp"))?;
-    candidate.exists().then_some(candidate)
 }

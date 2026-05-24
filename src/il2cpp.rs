@@ -350,7 +350,7 @@ pub struct REMethod {
     pub flags: Vec<REMethodFlag>,
     #[serde(deserialize_with = "parse_address_u64")]
     pub function: u64,
-    id: u64,
+    pub id: u64,
     #[serde(default, deserialize_with = "deserialize_impl_flags")]
     pub impl_flags: Vec<REImplFlag>,
     pub invoke_id: u32,
