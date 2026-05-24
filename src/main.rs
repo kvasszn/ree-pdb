@@ -95,6 +95,14 @@ pub struct PdbArgs {
         help = "fallback base address for symbols that cannot be mapped through the PE section table"
     )]
     address: u64,
+    #[arg(short, long, help="Skip methods")]
+    skip_methods: bool,
+    #[arg(short, long, help="Skip types (also skips enums)")]
+    skip_types: bool,
+    #[arg(short, long, help="Skip enums")]
+    skip_enums: bool,
+    #[arg(short, long, help="Skip static field symbols")]
+    skip_statics: bool,
 }
 
 pub fn resolve_enum_path(args: &PdbArgs) -> Option<PathBuf> {
@@ -232,6 +240,10 @@ fn add_types_in_order(
     filter: Option<String>,
     fallback_addr_offset: u64,
     ida_safe_enums: bool,
+    skip_methods: bool,
+    skip_types: bool,
+    skip_enums: bool,
+    skip_static: bool,
     verbose: bool,
 ) -> Result<AddStats> {
     let mut stats = AddStats::default();
@@ -240,213 +252,251 @@ fn add_types_in_order(
     let filter = filter.map(|s| Regex::new(&s).expect("invalid regex"));
     let added = visit_in_order(il2cpp, &mut visited, &filter, |ty| {
         let name = &ty.name;
-        if ty.is_enum() {
-            if verbose {
-                println!("Adding Type {name}");
-            }
-
-            if let Some(val_field) = ty.fields.get("value__") {
-                let underlying_type = get_pdb_type(&val_field.r#type, il2cpp);
-                if let Some(variants) = enum_map
-                    .get(name.as_str())
-                        .filter(|variants| !variants.is_empty())
-                {
-                    if verbose {
-                        println!("[INFO] Adding Enum {}", name);
-                    }
-                    let variants: Vec<PDBEnumVariant> = variants
-                        .iter()
-                        .map(|variant| PDBEnumVariant {
-                            name: if ida_safe_enums {
-                                format!(
-                                    "{}__{}",
-                                    sanitize_member_prefix(name),
-                                    sanitize_member_prefix(&variant.name)
-                                )
-                            } else {
-                                variant.name.clone()
-                            },
-                            value: variant.value,
-                            is_unsigned: variant.is_unsigned,
-                        })
-                    .collect();
-                    pdb.insert_enum(name, &underlying_type, &variants).unwrap();
-                    stats.enums_added += 1;
-                } else {
-                    let fields = vec![StructField {
-                        ty: underlying_type,
-                        name: "value__".to_string(),
-                        offset: 0,
-                        is_static: false,
-                    }];
-                    pdb.insert_struct(name, &fields, 4).unwrap();
-                    stats.structs_added += 1;
+        if !skip_types {
+            if ty.is_enum() && !skip_enums {
+                if verbose {
+                    println!("Adding Type {name}");
                 }
-            }
-        } else if ty.is_value_type() {
-            let (struct_fields, inherited_fields_added) = ty.get_struct_fields(il2cpp).unwrap();
-            stats.inherited_fields_added += inherited_fields_added;
-            pdb.insert_struct(&name, &struct_fields, ty.size as u64).unwrap();
-            stats.structs_added += 1;
-        } else if ty.flags.contains(&RETypeFlag::ManagedVTable) {
-            let vtable_name = format!("{}__vtable", &name);
-            let (vtable_size, vtable_fields) = ty.get_struct_vtable(il2cpp).unwrap();
 
-            if verbose {
-                println!("Adding vtable {vtable_name}");
-            }
-            pdb.insert_struct(&vtable_name, &vtable_fields, vtable_size).unwrap();
-            stats.structs_added += 1;
+                if let Some(val_field) = ty.fields.get("value__") {
+                    let underlying_type = get_pdb_type(&val_field.r#type, il2cpp);
+                    if let Some(variants) = enum_map
+                        .get(name.as_str())
+                            .filter(|variants| !variants.is_empty())
+                    {
+                        if verbose {
+                            println!("[INFO] Adding Enum {}", name);
+                        }
+                        let variants: Vec<PDBEnumVariant> = variants
+                            .iter()
+                            .map(|variant| PDBEnumVariant {
+                                name: if ida_safe_enums {
+                                    format!(
+                                        "{}__{}",
+                                        sanitize_member_prefix(name),
+                                        sanitize_member_prefix(&variant.name)
+                                    )
+                                } else {
+                                    variant.name.clone()
+                                },
+                                value: variant.value,
+                                is_unsigned: variant.is_unsigned,
+                            })
+                        .collect();
+                        pdb.insert_enum(name, &underlying_type, &variants).unwrap();
+                        stats.enums_added += 1;
+                    } else {
+                        let fields = vec![StructField {
+                            ty: underlying_type,
+                            name: "value__".to_string(),
+                            offset: 0,
+                            is_static: false,
+                        }];
+                        pdb.insert_struct(name, &fields, 4).unwrap();
+                        stats.structs_added += 1;
+                    }
+                }
+            } else if ty.is_value_type() {
+                let (struct_fields, inherited_fields_added) = ty.get_struct_fields(il2cpp).unwrap();
+                stats.inherited_fields_added += inherited_fields_added;
+                pdb.insert_struct(&name, &struct_fields, ty.size as u64).unwrap();
+                stats.structs_added += 1;
+            } else if ty.flags.contains(&RETypeFlag::ManagedVTable) && !skip_types {
+                let vtable_name = format!("{}__vtable", &name);
+                let (vtable_size, vtable_fields) = ty.get_struct_vtable(il2cpp).unwrap();
 
-            let (mut main_struct_fields, inherited_fields_added) = ty.get_struct_fields(il2cpp).unwrap();
-            stats.inherited_fields_added += inherited_fields_added;
-            // TODO: move this into a get_struct_fields
-            if ty.parent == "System.Array" {
+                if verbose {
+                    println!("Adding vtable {vtable_name}");
+                }
+                pdb.insert_struct(&vtable_name, &vtable_fields, vtable_size).unwrap();
+                stats.structs_added += 1;
 
-                main_struct_fields.push(StructField {
-                    ty: PDBType::Pointer(Box::new(PDBType::Struct(vtable_name))),
-                    name: "__vftable".to_string(),
-                    offset: 0x0,
-                    is_static: false,
-                });
-                main_struct_fields.push(StructField {
-                    ty: PDBType::SimpleType(SimpleTypeKind::UInt32),
-                    name: "__ref_count".to_string(),
-                    offset: 0x8,
-                    is_static: false,
-                });
-                main_struct_fields.push(StructField {
-                    ty: PDBType::Pointer(Box::new(PDBType::SimpleType(SimpleTypeKind::Void))),
-                    name: "contained_type".to_string(),
-                    offset: 0x10,
-                    is_static: false,
-                });
-                main_struct_fields.push(StructField {
-                    ty: PDBType::SimpleType(SimpleTypeKind::UInt32),
-                    name: "count".to_string(),
-                    offset: 0x18,
-                    is_static: false,
-                });
-                main_struct_fields.push(StructField {
-                    ty: PDBType::SimpleType(SimpleTypeKind::UInt32),
-                    name: "n".to_string(),
-                    offset: 0x1c,
-                    is_static: false,
-                });
-                let contained_type = get_pdb_type(&array_contained_type(&ty.name), il2cpp);
-                main_struct_fields.push(StructField {
-                    ty: PDBType::ConstantArray(Box::new(contained_type), 0),
-                    name: "elements".to_string(),
-                    offset: 0x20,
-                    is_static: false,
-                });
+                let (mut main_struct_fields, inherited_fields_added) = ty.get_struct_fields(il2cpp).unwrap();
+                stats.inherited_fields_added += inherited_fields_added;
+                // TODO: move this into a get_struct_fields
+                if ty.parent == "System.Array" {
+
+                    main_struct_fields.push(StructField {
+                        ty: PDBType::Pointer(Box::new(PDBType::Struct(vtable_name))),
+                        name: "__vftable".to_string(),
+                        offset: 0x0,
+                        is_static: false,
+                    });
+                    main_struct_fields.push(StructField {
+                        ty: PDBType::SimpleType(SimpleTypeKind::UInt32),
+                        name: "__ref_count".to_string(),
+                        offset: 0x8,
+                        is_static: false,
+                    });
+                    main_struct_fields.push(StructField {
+                        ty: PDBType::Pointer(Box::new(PDBType::SimpleType(SimpleTypeKind::Void))),
+                        name: "contained_type".to_string(),
+                        offset: 0x10,
+                        is_static: false,
+                    });
+                    main_struct_fields.push(StructField {
+                        ty: PDBType::SimpleType(SimpleTypeKind::UInt32),
+                        name: "count".to_string(),
+                        offset: 0x18,
+                        is_static: false,
+                    });
+                    main_struct_fields.push(StructField {
+                        ty: PDBType::SimpleType(SimpleTypeKind::UInt32),
+                        name: "n".to_string(),
+                        offset: 0x1c,
+                        is_static: false,
+                    });
+                    let contained_type = get_pdb_type(&array_contained_type(&ty.name), il2cpp);
+                    main_struct_fields.push(StructField {
+                        ty: PDBType::ConstantArray(Box::new(contained_type), 0),
+                        name: "elements".to_string(),
+                        offset: 0x20,
+                        is_static: false,
+                    });
+                } else {
+                    main_struct_fields.push(StructField {
+                        ty: PDBType::Pointer(Box::new(PDBType::Struct(vtable_name))),
+                        name: "__vftable".to_string(),
+                        offset: 0x0,
+                        is_static: false,
+                    });
+                    main_struct_fields.push(StructField {
+                        ty: PDBType::SimpleType(SimpleTypeKind::UInt32),
+                        name: "__ref_count".to_string(),
+                        offset: 0x8,
+                        is_static: false,
+                    });
+                }
+
+                main_struct_fields.sort_by_key(|f| f.offset);
+                if ty.parent == "System.Array" {
+                    pdb.insert_struct(&name, &main_struct_fields, 0x20).unwrap();
+                } else {
+                    pdb.insert_struct(&name, &main_struct_fields, ty.size as u64).unwrap();
+                }
+                stats.structs_added += 1;
             } else {
-                main_struct_fields.push(StructField {
-                    ty: PDBType::Pointer(Box::new(PDBType::Struct(vtable_name))),
-                    name: "__vftable".to_string(),
-                    offset: 0x0,
-                    is_static: false,
-                });
-                main_struct_fields.push(StructField {
-                    ty: PDBType::SimpleType(SimpleTypeKind::UInt32),
-                    name: "__ref_count".to_string(),
-                    offset: 0x8,
-                    is_static: false,
-                });
+                //println!("Adding normal struct {}", t.name);
+                let (struct_fields, inherited_fields_added) = ty.get_struct_fields(il2cpp).unwrap();
+                stats.inherited_fields_added += inherited_fields_added;
+                pdb.insert_struct(&name, &struct_fields, ty.size as u64).unwrap();
+                stats.structs_added += 1;
             }
-
-            main_struct_fields.sort_by_key(|f| f.offset);
-            if ty.parent == "System.Array" {
-                pdb.insert_struct(&name, &main_struct_fields, 0x20).unwrap();
-            } else {
-                pdb.insert_struct(&name, &main_struct_fields, ty.size as u64).unwrap();
-            }
-            stats.structs_added += 1;
-        } else {
-            //println!("Adding normal struct {}", t.name);
-            let (struct_fields, inherited_fields_added) = ty.get_struct_fields(il2cpp).unwrap();
-            stats.inherited_fields_added += inherited_fields_added;
-            pdb.insert_struct(&name, &struct_fields, ty.size as u64).unwrap();
-            stats.structs_added += 1;
         }
 
 
-        for (_f_name, function) in &ty.methods {
-            if function.function != 0 {
-                let signature = function.signature(ty);
-                if verbose {
-                    println!("\tAdding function {}@{:x}", signature, function.function);
-                }
-                let Some((pdb_address, used_fallback)) =
-                    resolve_function_address(address_map, function.function, fallback_addr_offset)
-                else {
-                    stats.functions_skipped_outside_sections += 1;
+        if !skip_methods {
+
+            for (_f_name, function) in &ty.methods {
+                if function.function != 0 {
+                    let signature = function.signature(ty);
                     if verbose {
-                        println!(
-                            "\tSkipping function {}@{:x}: address is outside PE sections",
-                            signature, function.function
-                        );
+                        println!("\tAdding function {}@{:x}", signature, function.function);
                     }
-                    continue;
-                };
-                if used_fallback {
-                    stats.functions_mapped_by_fallback += 1;
-                }
+                    let Some((pdb_address, used_fallback)) =
+                        resolve_function_address(address_map, function.function, fallback_addr_offset)
+                    else {
+                        stats.functions_skipped_outside_sections += 1;
+                        if verbose {
+                            println!(
+                                "\tSkipping function {}@{:x}: address is outside PE sections",
+                                signature, function.function
+                            );
+                        }
+                        continue;
+                    };
+                    if used_fallback {
+                        stats.functions_mapped_by_fallback += 1;
+                    }
 
-                let pdb_func = function.get_pdb_function(Some(&name), il2cpp);
-                let func_type = PDBType::Function(pdb_func);
-                let sym_name = function.symbol_name(ty);
-                let mut param_names = vec![];
-                param_names.push("vmctx");
-                if function.impl_flags.contains(&REImplFlag::HasThis) {
-                    param_names.push("this");
-                }
+                    let pdb_func = function.get_pdb_function(Some(&name), il2cpp);
+                    let func_type = PDBType::Function(pdb_func);
+                    let sym_name = function.symbol_name(ty);
+                    let mut param_names = vec![];
+                    param_names.push("vmctx");
+                    if function.impl_flags.contains(&REImplFlag::HasThis) {
+                        param_names.push("this");
+                    }
 
-                if let Some(params) = &function.params {
-                    for param in params {
-                        if param.name.is_empty() {
-                            // hopefully the dissassembler renames blank names itself pls and ty
-                            param_names.push("");
-                        } else {
-                            param_names.push(param.name.as_str());
+                    if let Some(params) = &function.params {
+                        for param in params {
+                            if param.name.is_empty() {
+                                // hopefully the dissassembler renames blank names itself pls and ty
+                                param_names.push("");
+                            } else {
+                                param_names.push(param.name.as_str());
+                            }
                         }
                     }
+                    //pdb.insert_function(1, offset_addr, &sym_name, None)?;
+                    pdb.insert_function(
+                        pdb_address.section,
+                        pdb_address.offset,
+                        &sym_name,
+                        Some(&func_type),
+                        &param_names,
+                    ).unwrap();
+                    stats.functions_added += 1;
+                    //pdb.insert_function(1, offset_addr, &function.name, Some(&func_type))?;
                 }
-                //pdb.insert_function(1, offset_addr, &sym_name, None)?;
-                pdb.insert_function(
-                    pdb_address.section,
-                    pdb_address.offset,
-                    &sym_name,
-                    Some(&func_type),
-                    &param_names,
-                ).unwrap();
-                stats.functions_added += 1;
-                //pdb.insert_function(1, offset_addr, &function.name, Some(&func_type))?;
             }
         }
     });
 
-    let analyzer = Analyzer::new(il2cpp, exe)?;
-    let singletons = analyzer.find_singletons();
-    println!("{:#?}", singletons);
-    for (ty_name, singleton_ptr) in singletons {
-        if added.contains(&ty_name.as_str()) {
-            let Some((pdb_address, _used_fallback)) =
-                resolve_function_address(address_map, singleton_ptr, fallback_addr_offset)
-                else {
-                    stats.functions_skipped_outside_sections += 1;
-                    if verbose {
-                        println!(
-                            "\tSkipping singleton {}@{:x}: address is outside PE sections",
-                            ty_name, singleton_ptr 
-                        );
-                    }
-                    continue;
-                };
-            let ty = PDBType::Pointer(Box::new(PDBType::Struct(ty_name.clone())));
-            pdb.insert_global(&ty_name, pdb_address.section, pdb_address.offset, Some(&ty))?;
+    if !skip_static {
+        let analyzer = Analyzer::new(il2cpp, exe)?;
+        let native_singletons = analyzer.find_native_singletons();
+        println!("[INFO] found {} native singletons", native_singletons.len());
+        for (ty_name, singleton_ptr) in native_singletons {
+            if added.contains(&ty_name.as_str()) {
+                let Some((pdb_address, _used_fallback)) =
+                    resolve_function_address(address_map, singleton_ptr, fallback_addr_offset)
+                    else {
+                        if verbose {
+                            println!(
+                                "\tSkipping singleton {}@{:x}: address is outside PE sections",
+                                ty_name, singleton_ptr 
+                            );
+                        }
+                        continue;
+                    };
+                    let ty = PDBType::Pointer(Box::new(PDBType::Struct(ty_name.clone())));
+                    let name = format!("{ty_name}::Instance");
+                    pdb.insert_global(&name, pdb_address.section, pdb_address.offset, Some(&ty))?;
+            }
+        }
+
+        let static_fields = analyzer.find_static_fields();
+        println!("[INFO] found static fields for {} types", static_fields.len());
+        for (ty_name, fields) in &static_fields {
+            for (field_name, (addr, ret_type)) in fields {
+                if added.contains(&ty_name.as_str()) {
+                    let full_name = format!("{ty_name}::{field_name}");
+                    let Some((pdb_address, _used_fallback)) =
+                        resolve_function_address(address_map, *addr, fallback_addr_offset)
+                        else {
+                            if verbose {
+                                println!(
+                                    "\tSkipping static field {}@{:x}: address is outside PE sections",
+                                    full_name, addr
+                                );
+                            }
+                            continue;
+                        };
+
+                        // for singletons (_Instance field), the whole type name can be annoying so shorten it here
+                        let name = if field_name == "_Instance" {
+                            format!("{ret_type}::_Instance")
+                        } else {
+                            full_name
+                        };
+                        let ty = PDBType::Pointer(Box::new(PDBType::Struct(ret_type.clone())));
+                        pdb.insert_global(&name, pdb_address.section, pdb_address.offset, Some(&ty))?;
+                }
+            }
         }
     }
+
     Ok(stats)
 }
 
@@ -493,6 +543,7 @@ fn main() -> Result<()> {
     let start_time = Instant::now();
 
     println!("[INFO] Adding {} il2cpp types", il2cpp.len());
+    // this should not have this many args lolol hahahah
     let stats = add_types_in_order(
         &mut pdb,
         &il2cpp,
@@ -502,6 +553,10 @@ fn main() -> Result<()> {
         args.filter,
         args.address,
         args.ida_safe_enums,
+        args.skip_methods,
+        args.skip_types,
+        args.skip_enums,
+        args.skip_statics,
         args.verbose,
     )?;
     println!(
