@@ -2,6 +2,8 @@ use std::{
     collections::{HashMap, HashSet}, hash::Hash
 };
 
+use rustc_hash::FxHashMap;
+
 use crate::util::*;
 
 use anyhow::{Result, bail};
@@ -13,48 +15,51 @@ use pdb_wrapper::{
 use strum::EnumString;
 
 
-fn deserialize_fields<'de, D>(deserializer: D) -> Result<HashMap<String, REField>, D::Error>
+fn deserialize_fields<'de, 'a, D>(deserializer: D) -> Result<FxHashMap<&'a str, REField<'a>>, D::Error>
 where
     D: Deserializer<'de>,
+    'de: 'a
 {
-    let mut map: HashMap<String, REField> = HashMap::deserialize(deserializer)?;
+    let mut map: FxHashMap<&'a str, REField<'a>> = HashMap::deserialize(deserializer)?;
     for (key, t_data) in map.iter_mut() {
-        t_data.name = key.clone();
+        t_data.name = key;
     }
     Ok(map)
 }
 
-fn deserialize_methods<'de, D>(deserializer: D) -> Result<HashMap<String, REMethod>, D::Error>
+fn deserialize_methods<'de, 'a,  D>(deserializer: D) -> Result<FxHashMap<&'a str, REMethod<'a>>, D::Error>
 where
     D: Deserializer<'de>,
+    'de: 'a
 {
-    let mut map: HashMap<String, REMethod> = HashMap::deserialize(deserializer)?;
+    let mut map: FxHashMap<&'a str, REMethod<'a>> = HashMap::deserialize(deserializer)?;
     for (key, t_data) in map.iter_mut() {
-        t_data.name = key.clone();
+        t_data.name = key;
     }
     Ok(map)
 }
 
-pub fn deserialize_il2cpp<'de, D>(deserializer: D) -> Result<Il2Cpp, D::Error>
+pub fn deserialize_il2cpp<'de, 'a, D>(deserializer: D) -> Result<Il2Cpp<'a>, D::Error>
 where
     D: Deserializer<'de>,
+    'de: 'a
 {
-    let mut map: HashMap<String, REType> = HashMap::deserialize(deserializer)?;
+    let mut map: FxHashMap<&'a str, REType<'a>> = HashMap::deserialize(deserializer)?;
     for (key, t_data) in map.iter_mut() {
-        t_data.name = key.clone();
+        t_data.name = key;
     }
     Ok(map)
 }
 
-pub type Il2Cpp = HashMap<String, REType>;
+pub type Il2Cpp<'a> = FxHashMap<&'a str, REType<'a>>;
 
 // i really should impl Deserialize myself to get better descriptions of the type,
 // or just convert to PDBType, etc before adding everything
 #[allow(unused)]
 #[derive(Debug, Deserialize)]
-pub struct REType {
+pub struct REType<'a> {
     #[serde(skip)]
-    pub name: String,
+    pub name: &'a str,
     #[serde(default, deserialize_with = "parse_address_u64")]
     pub address: u64,
     #[serde(deserialize_with = "parse_address_u32")]
@@ -62,7 +67,7 @@ pub struct REType {
     #[serde(default, deserialize_with = "deserialize_type_flags")]
     pub flags: Vec<RETypeFlag>,
     #[serde(default, deserialize_with = "deserialize_fields")]
-    pub fields: HashMap<String, REField>,
+    pub fields: FxHashMap<&'a str, REField<'a>>,
     #[serde(deserialize_with = "parse_address_u64")]
     fqn: u64,
     #[serde(default)]
@@ -72,34 +77,35 @@ pub struct REType {
     #[serde(default)]
     is_generic_type_definition: bool,
     #[serde(default, deserialize_with = "deserialize_methods")]
-    pub methods: HashMap<String, REMethod>,
+    pub methods: FxHashMap<&'a str, REMethod<'a>>,
     #[serde(default)]
-    name_hierarchy: Vec<String>,
+    name_hierarchy: Vec<&'a str>,
     #[serde(default)]
-    pub native_typename: String,
+    pub native_typename: &'a str,
     #[serde(default)]
-    pub parent: String,
+    pub parent: &'a str,
     #[serde(default)]
-    pub properties: HashMap<String, REProperty>,
+    pub properties: FxHashMap<&'a str, REProperty<'a>>,
     #[serde(default, deserialize_with = "parse_address_u32")]
     pub size: u32,
 }
 
-impl Hash for REType {
+impl<'a> Hash for REType<'a> {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.name.hash(state);
+        self.id.hash(state);
     }
 }
 
-impl PartialEq for REType {
+impl<'a> PartialEq for REType<'a> {
     fn eq(&self, other: &Self) -> bool {
         self.name == other.name && self.id == other.id
     }
 }
 
-impl Eq for REType { }
+impl<'a> Eq for REType<'a> { }
 
-impl REType {
+impl<'a> REType<'a> {
     #[inline]
     pub fn is_enum_or_value_type(&self) -> bool {
         self.is_enum() || self.is_value_type()
@@ -107,12 +113,12 @@ impl REType {
 
     #[inline]
     pub fn is_enum(&self) -> bool {
-        self.parent.as_str() == "System.Enum"
+        self.parent == "System.Enum"
     }
 
     #[inline]
     pub fn is_value_type(&self) -> bool {
-        self.parent.as_str() == "System.ValueType"
+        self.parent == "System.ValueType"
     }
 
     fn get_field_offset(&self, field: &REField) -> u64 {
@@ -139,7 +145,7 @@ impl REType {
 
             let name = inherited_name_prefix
                 .map(|prefix| format!("{prefix}__{f_name}"))
-                .unwrap_or_else(|| f_name.clone());
+                .unwrap_or_else(|| f_name.to_string());
             let sf = StructField {
                 ty,
                 name,
@@ -157,7 +163,7 @@ impl REType {
 
         if !self.is_enum_or_value_type() {
             let mut ancestors = vec![];
-            let mut parent_name = self.parent.as_str();
+            let mut parent_name = self.parent;
             let mut seen = HashSet::new();
 
             while !parent_name.is_empty()
@@ -169,7 +175,7 @@ impl REType {
                     break;
                 };
                 ancestors.push(parent);
-                parent_name = parent.parent.as_str();
+                parent_name = parent.parent;
             }
 
             ancestors.reverse();
@@ -186,16 +192,16 @@ impl REType {
         Ok((struct_fields, inherited_fields_added))
     }
 
-    pub fn iter_vtable_methods<'a>(&'a self, il2cpp: &'a Il2Cpp) -> impl Iterator<Item = (u64, &'a REMethod)>
+    pub fn iter_vtable_methods(&'a self, il2cpp: &'a Il2Cpp) -> impl Iterator<Item = (u64, &'a REMethod)>
     {
         let mut ancestors = vec![self];
-        let mut parent_name = self.parent.as_str();
+        let mut parent_name = self.parent;
         let mut seen_classes = HashSet::new();
 
         while !parent_name.is_empty() && seen_classes.insert(parent_name.to_string()) {
             if let Some(parent) = il2cpp.get(parent_name) {
                 ancestors.push(parent);
-                parent_name = parent.parent.as_str();
+                parent_name = parent.parent;
             } else {
                 break;
             }
@@ -241,7 +247,7 @@ impl REType {
             let offset = vtable_index as u64 * 8 + 8;
             vtable_fields.push(StructField {
                 ty: func_ptr_type,
-                name: method.name.clone(),
+                name: method.name.to_string(),
                 offset,
                 is_static: false,
             });
@@ -281,7 +287,7 @@ fn deserialize_type_flags<'de, D>(deserializer: D) -> Result<Vec<RETypeFlag>, D:
 where
     D: Deserializer<'de>,
 {
-    let value = String::deserialize(deserializer)?;
+    let value = <&str>::deserialize(deserializer)?;
     let flags: Vec<RETypeFlag> = value.split('|')
         .filter_map(|s| {
             let s = s.trim();
@@ -300,16 +306,16 @@ where
 
 #[allow(unused)]
 #[derive(Debug, Deserialize)]
-pub struct REField {
+pub struct REField<'a> {
     #[serde(skip)]
-    pub name: String,
+    pub name: &'a str,
     id: u64,
     pub init_data_index: u32,
     #[serde(deserialize_with = "parse_address_u32")]
     pub offset_from_base: u32,
     #[serde(deserialize_with = "parse_address_u32")]
     pub offset_from_fieldptr: u32,
-    pub r#type: String,
+    pub r#type: &'a str,
     #[serde(default, deserialize_with = "deserialize_field_flags")]
     pub flags: Vec<REFieldFlag>,
 }
@@ -337,7 +343,7 @@ fn deserialize_field_flags<'de, D>(deserializer: D) -> Result<Vec<REFieldFlag>, 
 where
     D: Deserializer<'de>,
 {
-    let value = String::deserialize(deserializer)?;
+    let value = <&str>::deserialize(deserializer)?;
     let flags: Vec<REFieldFlag> = value.split('|')
         .filter_map(|s| {
             let s = s.trim();
@@ -357,9 +363,9 @@ where
 
 #[allow(unused)]
 #[derive(Debug, Deserialize)]
-pub struct REMethod {
+pub struct REMethod<'a> {
     #[serde(skip)]
-    pub name: String,
+    pub name: &'a str,
     #[serde(default, deserialize_with = "deserialize_method_flags")]
     pub flags: Vec<REMethodFlag>,
     #[serde(deserialize_with = "parse_address_u64")]
@@ -368,12 +374,13 @@ pub struct REMethod {
     #[serde(default, deserialize_with = "deserialize_impl_flags")]
     pub impl_flags: Vec<REImplFlag>,
     pub invoke_id: u32,
-    pub params: Option<Vec<REParam>>,
-    pub returns: Option<REParam>,
+    #[serde(borrow)]
+    pub params: Option<Vec<REParam<'a>>>,
+    pub returns: Option<REParam<'a>>,
     pub vtable_index: Option<u32>,
 }
 
-impl REMethod {
+impl<'a> REMethod<'a> {
     pub fn symbol_name(&self, r#type: &REType) -> String {
         format!("{}::{}", r#type.name, self.name)
     }
@@ -504,7 +511,7 @@ fn deserialize_method_flags<'de, D>(deserializer: D) -> Result<Vec<REMethodFlag>
 where
     D: Deserializer<'de>,
 {
-    let value = String::deserialize(deserializer)?;
+    let value = <&str>::deserialize(deserializer)?;
     let flags = value.split('|')
         .filter_map(|s| {
             let s = s.trim();
@@ -538,7 +545,7 @@ fn deserialize_impl_flags<'de, D>(deserializer: D) -> Result<Vec<REImplFlag>, D:
 where
     D: Deserializer<'de>,
 {
-    let value = String::deserialize(deserializer)?;
+    let value = <&str>::deserialize(deserializer)?;
     let flags: Vec<REImplFlag> = value.split('|')
         .filter_map(|s| {
             let s = s.trim();
@@ -558,19 +565,19 @@ where
 
 #[allow(unused)]
 #[derive(Debug, Deserialize)]
-pub struct REParam {
-    pub name: String,
-    pub r#type: String,
+pub struct REParam<'a> {
+    pub name: &'a str,
+    pub r#type: &'a str,
 }
 
 #[allow(unused)]
 #[derive(Debug, Deserialize)]
-pub struct REProperty {
+pub struct REProperty<'a> {
     #[serde(skip)]
-    pub name: String,
-    pub getter: String,
+    pub name: &'a str,
+    pub getter: &'a str,
     pub id: u32,
-    pub setter: String,
+    pub setter: &'a str,
 }
 
 

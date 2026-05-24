@@ -26,7 +26,7 @@ pub fn print_instruction<F: Formatter>(output: &mut String, instruction: &mut In
 }
 
 pub struct Analyzer<'a> {
-    il2cpp: &'a Il2Cpp,
+    il2cpp: &'a Il2Cpp<'a>,
     exe_base: u64,
     virtual_memory: Vec<u8>,
 }
@@ -90,7 +90,7 @@ impl<'a> Analyzer<'a> {
                     if let Some(ptr) = is_mov_ret_reg_ptr(&instruction) {
                         if let Some(return_type) = &method.returns {
                             // println!("[INFO] Found singleton pointer at: {:016X} of type {}", global_ptr, return_type.r#type);
-                            return Some((ptr, return_type.r#type.clone()));
+                            return Some((ptr, return_type.r#type.to_string()));
                         }
                     }
 
@@ -146,12 +146,12 @@ impl<'a> Analyzer<'a> {
             if ty.name.starts_with("via.") {
                 let singleton_ptr = self.find_native_singleton(ty);
                 if let Some(singleton) = singleton_ptr {
-                    singletons.insert(ty.name.clone(), singleton);
+                    singletons.insert(ty.name.to_string(), singleton);
                 }
             }
 
             // other singletons (NOTE: these are also found in find_static_fields, can probably remove)
-            if let Some(instance_field) = ty.fields.values().find(|f| f.name.as_str() == "_Instance") {
+            if let Some(instance_field) = ty.fields.values().find(|f| f.name == "_Instance") {
                 if instance_field.flags.contains(&REFieldFlag::Static) {
                     if let Some((singleton, ty_name)) = self.find_singleton(ty) {
                         singletons.insert(ty_name, singleton);
@@ -169,7 +169,7 @@ impl<'a> Analyzer<'a> {
             if ty.name.starts_with("via.") {
                 let singleton_ptr = self.find_native_singleton(ty);
                 if let Some(singleton) = singleton_ptr {
-                    singletons.insert(ty.name.clone(), singleton);
+                    singletons.insert(ty.name.to_string(), singleton);
                 }
             }
         }
@@ -232,7 +232,7 @@ impl<'a> Analyzer<'a> {
             for method in methods {
                 let field_name = method.name.replace(&method.id.to_string(), "").replace("get", "");
                 let Some(ref ret_type) = method.returns else { continue };
-                if let Some(field) = ty.fields.get(&field_name) {
+                if let Some(field) = ty.fields.get(&field_name.as_str()) {
                     //println!("Checking {}::{} using method {}", ty.name, field_name, method.name);
                     // just to make sure
                     if field.flags.contains(&REFieldFlag::Static) {
@@ -246,7 +246,7 @@ impl<'a> Analyzer<'a> {
                 }
             }
             if !ty_statics.is_empty() {
-                static_fields.insert(ty.name.clone(), ty_statics);
+                static_fields.insert(ty.name.to_string(), ty_statics);
             }
         }
         static_fields
@@ -300,7 +300,7 @@ impl<'a> Analyzer<'a> {
 
     // TODO: add a regex filter for the types
     // NOTE: could maybe remove the InternalCall check, and just look for Native
-    pub fn resolve_native_thunks(&'a self) -> HashMap<&'a REType, Vec<(&'a REMethod, u64)>>{
+    pub fn resolve_native_thunks(&'a self) -> HashMap<&'a REType<'a>, Vec<(&'a REMethod<'a>, u64)>>{
         let mut res = HashMap::new();
         for (_, ty) in self.il2cpp {
             // !ty.flags.contains(&RETypeFlag::NativeType) || // idk if this is needed, it can miss

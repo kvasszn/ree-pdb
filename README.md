@@ -11,6 +11,9 @@ To run it you need two things, an `il2cpp_dump.json` from reframework, and the g
 
 The first time you load a PDB it will probably take a while to load (on my slow laptop that's running out of ram, might take 15-30min). To make the loading faster, use the filter and flags to skip things if you want.
 
+> [!Note]
+> If you are looking at a lot of native stuff, you can try adding the `--resolve-native-thunks` so that ree-pdb analyzes native functions that look like thunks and names the callee native functions. It doesn't work perfectly for everything, but from some things I've looked at, it can be very useful.
+
 ```
 Usage: ree-pdb [OPTIONS] --exe <EXE>
 
@@ -58,9 +61,14 @@ I just moved the extracted files to `C:\Program Files\LLVM\`.
 I developed this on windows but the llvm tools are cross platform so I'll release a linux build at some point.
 
 Then just git clone and build. If you don't build in release it will be really really slow because rust 🚀. Other than that it's blazingly fast.
+
+> [!NOTE]
+> I recommend building with `RUSTFLAGS="-C target-cpu=native"`, it should hopefully speed things up.
 ```
 git clone https://github.com/kvasszn/ree-pdb.git
 cargo build --release --bin ree-pdb
+or
+RUSTFLAGS="-C target-cpu=native" cargo build --release --bin re-pdb
 ```
 
 ## TODO

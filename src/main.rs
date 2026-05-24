@@ -268,8 +268,7 @@ fn add_types_in_order(
 
                 if let Some(val_field) = ty.fields.get("value__") {
                     let underlying_type = get_pdb_type(&val_field.r#type, il2cpp);
-                    if let Some(variants) = enum_map
-                        .get(name.as_str())
+                    if let Some(variants) = enum_map.get(&name.to_string())
                             .filter(|variants| !variants.is_empty())
                     {
                         if verbose {
@@ -431,7 +430,7 @@ fn add_types_in_order(
                                 // hopefully the dissassembler renames blank names itself pls and ty
                                 param_names.push("");
                             } else {
-                                param_names.push(param.name.as_str());
+                                param_names.push(param.name);
                             }
                         }
                     }
@@ -546,7 +545,7 @@ fn add_types_in_order(
                             if param.name.is_empty() {
                                 param_names.push("");
                             } else {
-                                param_names.push(param.name.as_str());
+                                param_names.push(param.name);
                             }
                         }
                     }
@@ -572,11 +571,16 @@ fn main() -> Result<()> {
     let args = PdbArgs::parse();
 
     println!("[INFO] Loading il2cpp from {}", args.il2cpp);
-    let il2cpp = std::fs::read_to_string(&args.il2cpp)?;
-    let mut deserializer = serde_json::Deserializer::from_str(&il2cpp);
+    let il2cpp_timer = Instant::now();
+    //let il2cpp = std::fs::read_to_string(&args.il2cpp)?;
+    //let mut deserializer = serde_json::Deserializer::from_str(&il2cpp);
+    // simd_json kinda slow af
+    //let mut il2cpp_bytes = std::fs::read(&args.il2cpp)?;
+    //let mut deserializer = simd_json::Deserializer::from_slice(&mut il2cpp_bytes)?;
+    let il2cpp_bytes = std::fs::read(&args.il2cpp)?;
+    let mut deserializer = sonic_rs::Deserializer::from_slice(&il2cpp_bytes);
     let il2cpp = deserialize_il2cpp(&mut deserializer)?;
-
-    println!("[INFO] Finished loading il2cpp");
+    println!("[INFO] Finished loading il2cpp dump in {}s", il2cpp_timer.elapsed().as_secs_f32());
 
     let enum_map = if let Some(enum_path) = resolve_enum_path(&args) {
         println!("[INFO] Loading enums from {}", enum_path.display());
