@@ -95,14 +95,16 @@ pub struct PdbArgs {
         help = "fallback base address for symbols that cannot be mapped through the PE section table"
     )]
     address: u64,
-    #[arg(short, long, help="Skip methods")]
+    #[arg(long, help="Skip methods")]
     skip_methods: bool,
-    #[arg(short, long, help="Skip types (also skips enums)")]
+    #[arg(long, help="Skip types (also skips enums)")]
     skip_types: bool,
-    #[arg(short, long, help="Skip enums")]
+    #[arg(long, help="Skip enums")]
     skip_enums: bool,
-    #[arg(short, long, help="Skip static field symbols")]
+    #[arg(long, help="Skip static field symbols")]
     skip_statics: bool,
+    #[arg(short, long, help="Attempts to find thunked native functions and name add symbols for them (experimental, function args might be incorrect))")]
+    resolve_native_thunks: bool,
 }
 
 pub fn resolve_enum_path(args: &PdbArgs) -> Option<PathBuf> {
@@ -184,6 +186,9 @@ struct AddStats {
     functions_added: usize,
     functions_mapped_by_fallback: usize,
     functions_skipped_outside_sections: usize,
+    thunked_functions: usize,
+    native_singletons: usize,
+    static_fields: usize,
 }
 
 // age, signature, guid
@@ -244,10 +249,13 @@ fn add_types_in_order(
     skip_types: bool,
     skip_enums: bool,
     skip_static: bool,
+    resolve_native_thunks: bool,
     verbose: bool,
 ) -> Result<AddStats> {
     let mut stats = AddStats::default();
     let mut visited = HashSet::new();
+    let mut symbols = HashSet::new();
+
     visited.insert("");
     let filter = filter.map(|s| Regex::new(&s).expect("invalid regex"));
     let added = visit_in_order(il2cpp, &mut visited, &filter, |ty| {
@@ -386,7 +394,6 @@ fn add_types_in_order(
 
 
         if !skip_methods {
-
             for (_f_name, function) in &ty.methods {
                 if function.function != 0 {
                     let signature = function.signature(ty);
@@ -409,7 +416,7 @@ fn add_types_in_order(
                         stats.functions_mapped_by_fallback += 1;
                     }
 
-                    let pdb_func = function.get_pdb_function(Some(&name), il2cpp);
+                    let pdb_func = function.get_pdb_function(Some(&name), il2cpp, true);
                     let func_type = PDBType::Function(pdb_func);
                     let sym_name = function.symbol_name(ty);
                     let mut param_names = vec![];
@@ -437,14 +444,15 @@ fn add_types_in_order(
                         &param_names,
                     ).unwrap();
                     stats.functions_added += 1;
+                    symbols.insert(function.function);
                     //pdb.insert_function(1, offset_addr, &function.name, Some(&func_type))?;
                 }
             }
         }
     });
 
+    let analyzer = Analyzer::new(il2cpp, exe)?;
     if !skip_static {
-        let analyzer = Analyzer::new(il2cpp, exe)?;
         let native_singletons = analyzer.find_native_singletons();
         println!("[INFO] found {} native singletons", native_singletons.len());
         for (ty_name, singleton_ptr) in native_singletons {
@@ -463,6 +471,8 @@ fn add_types_in_order(
                     let ty = PDBType::Pointer(Box::new(PDBType::Struct(ty_name.clone())));
                     let name = format!("{ty_name}::Instance");
                     pdb.insert_global(&name, pdb_address.section, pdb_address.offset, Some(&ty))?;
+                    symbols.insert(singleton_ptr);
+                    stats.native_singletons += 1;
             }
         }
 
@@ -472,28 +482,86 @@ fn add_types_in_order(
             for (field_name, (addr, ret_type)) in fields {
                 if added.contains(&ty_name.as_str()) {
                     let full_name = format!("{ty_name}::{field_name}");
-                    let Some((pdb_address, _used_fallback)) =
-                        resolve_function_address(address_map, *addr, fallback_addr_offset)
-                        else {
-                            if verbose {
-                                println!(
-                                    "\tSkipping static field {}@{:x}: address is outside PE sections",
-                                    full_name, addr
-                                );
-                            }
-                            continue;
-                        };
+                    let Some((pdb_address, _used_fallback)) = resolve_function_address(address_map, *addr, fallback_addr_offset) else {
+                        if verbose {
+                            println!(
+                                "\tSkipping static field {}@{:x}: address is outside PE sections",
+                                full_name, addr
+                            );
+                        }
+                        continue;
+                    };
 
-                        // for singletons (_Instance field), the whole type name can be annoying so shorten it here
-                        let name = if field_name == "_Instance" {
-                            format!("{ret_type}::_Instance")
-                        } else {
-                            full_name
-                        };
-                        let ty = PDBType::Pointer(Box::new(PDBType::Struct(ret_type.clone())));
-                        pdb.insert_global(&name, pdb_address.section, pdb_address.offset, Some(&ty))?;
+                    // for singletons (_Instance field), the whole type name can be annoying so shorten it here
+                    let name = if field_name == "_Instance" {
+                        format!("{ret_type}::_Instance")
+                    } else {
+                        full_name
+                    };
+                    let ty = PDBType::Pointer(Box::new(PDBType::Struct(ret_type.clone())));
+                    pdb.insert_global(&name, pdb_address.section, pdb_address.offset, Some(&ty))?;
+                    symbols.insert(*addr);
+                    stats.static_fields += 1;
                 }
             }
+        }
+
+    }
+
+    if resolve_native_thunks {
+        let thunked = analyzer.resolve_native_thunks();
+        for (ty, methods) in thunked {
+            for (method, thunked_function) in methods {
+                if thunked_function != 0 {
+                    let signature = method.thunked_signature(ty);
+                    if verbose {
+                        println!("\tAdding function {}@{:x}", signature, thunked_function);
+                    }
+                    let Some((pdb_address, used_fallback)) =
+                        resolve_function_address(address_map, thunked_function, fallback_addr_offset)
+                    else {
+                        stats.functions_skipped_outside_sections += 1;
+                        if verbose {
+                            println!(
+                                "\tSkipping thunked function {}@{:x}: address is outside PE sections",
+                                signature, thunked_function
+                            );
+                        }
+                        continue;
+                    };
+                    if used_fallback {
+                        stats.functions_mapped_by_fallback += 1;
+                    }
+
+                    let pdb_func = method.get_pdb_function(Some(&ty.name), il2cpp, false);
+                    let func_type = PDBType::Function(pdb_func);
+                    let sym_name = method.thunked_symbol_name(ty);
+                    let mut param_names = vec![];
+                    if method.impl_flags.contains(&REImplFlag::HasThis) {
+                        param_names.push("this");
+                    }
+
+                    if let Some(params) = &method.params {
+                        for param in params {
+                            if param.name.is_empty() {
+                                param_names.push("");
+                            } else {
+                                param_names.push(param.name.as_str());
+                            }
+                        }
+                    }
+                    pdb.insert_function(
+                        pdb_address.section,
+                        pdb_address.offset,
+                        &sym_name,
+                        Some(&func_type),
+                        &param_names,
+                    ).unwrap();
+                    stats.thunked_functions += 1;
+                    symbols.insert(method.function);
+                }
+            }
+
         }
     }
 
@@ -557,14 +625,18 @@ fn main() -> Result<()> {
         args.skip_types,
         args.skip_enums,
         args.skip_statics,
+        args.resolve_native_thunks,
         args.verbose,
     )?;
     println!(
-        "[INFO] Added {} structs, {} enums, {} inherited fields, and {} functions in {}s",
+        "[INFO] Added {} structs, {} enums, {} inherited fields, {} static fields, {} native singletons, {} functions, and {} thunked_functions in {}s",
         stats.structs_added,
         stats.enums_added,
         stats.inherited_fields_added,
+        stats.static_fields,
+        stats.native_singletons,
         stats.functions_added,
+        stats.thunked_functions,
         start_time.elapsed().as_secs_f32()
     );
     if stats.functions_mapped_by_fallback != 0 {

@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use iced_x86::{Decoder, DecoderOptions, FlowControl, Formatter, Instruction, Mnemonic, NasmFormatter, OpKind, Register};
 use object::read::pe::{PeFile64, };
 use object::{Object, ObjectSection, LittleEndian};
-use crate::il2cpp::{Il2Cpp, REFieldFlag, REMethod, REMethodFlag, REType};
+use crate::il2cpp::{Il2Cpp, REFieldFlag, REImplFlag, REMethod, REMethodFlag, REType, RETypeFlag};
 
 use anyhow::{Result};
 
@@ -250,6 +250,76 @@ impl<'a> Analyzer<'a> {
             }
         }
         static_fields
+    }
+
+
+    pub fn resolve_native_thunk(&'a self, method: &REMethod) -> Option<u64> {
+        let mut decoder = Decoder::new(64, &self.virtual_memory, DecoderOptions::NONE);
+
+        let addr = method.function;
+        let rva = self.to_rva(addr);
+        decoder.set_position(rva).ok()?;
+        decoder.set_ip(addr);
+
+        let mut it = decoder.iter();
+
+        // mainly two different setups
+        // Jmp instructions on like the second or first instruction should hopefully always be the thunked function
+        // Call instructions in short functions where there's only one call
+        // Sometimes if the result is not void, the function does some stuff with rax to make sure
+        // the type is correct
+        // NOTE: Some other situations are where there is a null check on the pointer arg, in this case
+        // could probably find those native functions too
+        // there's usually some function that gets called on the null branch to return some thing idk
+        let mut call_count = 0;
+        let mut called_function = None;
+        for i in 0..10 {
+            let instruction = it.next()?;
+            if i < 3 && instruction.mnemonic() == Mnemonic::Jmp {
+                let addr = instruction.near_branch_target();
+                return Some(addr);
+            }
+
+            if instruction.mnemonic() == Mnemonic::Call {
+                call_count += 1;
+                if call_count == 1 {
+                    called_function = Some(instruction.near_branch_target());
+                }
+            }
+
+            match instruction.flow_control() {
+                FlowControl::Call if call_count > 1 => return None,
+                FlowControl::Next | FlowControl::Call => continue,
+                FlowControl::Return if call_count == 1 => return called_function,
+                _ => return None,
+            }
+        }
+
+        None
+    }
+
+    // TODO: add a regex filter for the types
+    // NOTE: could maybe remove the InternalCall check, and just look for Native
+    pub fn resolve_native_thunks(&'a self) -> HashMap<&'a REType, Vec<(&'a REMethod, u64)>>{
+        let mut res = HashMap::new();
+        for (_, ty) in self.il2cpp {
+            // !ty.flags.contains(&RETypeFlag::NativeType) || // idk if this is needed, it can miss
+            // something like via.crypto.pkc
+            if !ty.name.starts_with("via.") {
+                continue
+            }
+            let methods: Vec<_> = ty.methods.values()
+                .filter(|m| m.impl_flags.contains(&REImplFlag::InternalCall) 
+                    && m.impl_flags.contains(&REImplFlag::Native))
+                .filter_map(|m| {
+                    let thunked_function = self.resolve_native_thunk(m);
+                    thunked_function.map(|f| (m, f))
+                }).collect();
+            if methods.len() > 0 {
+                res.insert(ty, methods);
+            }
+        }
+        res
     }
 }
 

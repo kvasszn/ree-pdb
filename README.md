@@ -2,12 +2,14 @@
 
 A tool to create a fake pdb from reframework's il2cpp dump.
 
-This makes it alot easier to get symbol information in whatever debugger/dissassembler you use (I've tested it on x64dbg, cheat engine 7.6, ghidra 12.0.2, IDA Pro 9.2). It's also blazingly fast 🚀 (kinda not really at all).
+This makes it alot easier to get symbol information in whatever debugger/dissassembler you use (I've tested it on x64dbg, cheat engine 7.6, ghidra 12.0.2 (might be borked on ghidra), IDA Pro 9.2). It's also blazingly fast 🚀 (kinda not really at all).
 
 I plan on adding better debug info, right now it's very rudamentary, it just generates function names and structs. *Expect the naming format of functions to change*
 
 ## Usage
 To run it you need two things, an `il2cpp_dump.json` from reframework, and the game exe (non-dumped (sometimes dumped maybe)).
+
+The first time you load a PDB it will probably take a while to load (on my slow laptop that's running out of ram, might take 15-30min). To make the loading faster, use the filter and flags to skip things if you want.
 
 ```
 Usage: ree-pdb [OPTIONS] --exe <EXE>
@@ -25,10 +27,11 @@ Options:
       --ida-safe-enums         prefix enum member names with the enum type name to avoid IDA enumerator-name collisions
   -v, --verbose
       --address <ADDRESS>      fallback base address for symbols that cannot be mapped through the PE section table [default: 5368713216]
-  -s, --skip-methods           Skip methods
-  -s, --skip-types             Skip types (also skips enums)
-  -s, --skip-enums             Skip enums
-  -s, --skip-statics           Skip static field symbols
+      --skip-methods           Skip methods
+      --skip-types             Skip types (also skips enums)
+      --skip-enums             Skip enums
+      --skip-statics           Skip static field symbols
+  -r, --resolve-native-thunks  Attempts to find thunked native functions and name add symbols for them (experimental, function args might be incorrect))
   -h, --help                   Print help
   -V, --version                Print version
 ```
@@ -73,6 +76,8 @@ cargo build --release --bin ree-pdb
 - [ ] static field literals (similar way as enums)
     - this would be nice since it wouldn't require parsing `Enums_Internal.hpp` anymore if done right
     - could probably convert some code for adding enums for this
+- [x] find native thunked functions
+- [ ] check if native thunked functions have a `this` passed in through a singleton
 - [ ] reflection methods and properties
 - [ ] it would be nice to try and statically analyze the binary to fill in types using simple getters/setters for native types without reflected fields
     - static fields are easy, non-static fields are harder

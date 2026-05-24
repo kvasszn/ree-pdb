@@ -87,10 +87,12 @@ pub fn main() -> Result<()> {
 
 
     let analyzer = Analyzer::new(&il2cpp, &bytes)?;
-    let singletons = analyzer.find_singletons();
+    let native_singletons = analyzer.find_native_singletons();
     //println!("{:#?}", singletons);
     let statics = analyzer.find_static_fields();
-    println!("{:#?}", statics);
+    //println!("{:#?}", statics);
+    let thunked = analyzer.resolve_native_thunks();
+    //println!("{:#?}", thunked);
     /*let ty = &il2cpp["via.storage.saveService.SaveService"];
     //let method = &ty.methods["get_SaveDataSize764593"];
 

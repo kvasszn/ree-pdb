@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet}
+    collections::{HashMap, HashSet}, hash::Hash
 };
 
 use crate::util::*;
@@ -84,6 +84,20 @@ pub struct REType {
     #[serde(default, deserialize_with = "parse_address_u32")]
     pub size: u32,
 }
+
+impl Hash for REType {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.name.hash(state);
+    }
+}
+
+impl PartialEq for REType {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name && self.id == other.id
+    }
+}
+
+impl Eq for REType { }
 
 impl REType {
     #[inline]
@@ -222,7 +236,7 @@ impl REType {
         });
 
         for (vtable_index, method) in self.iter_vtable_methods(il2cpp) {
-            let pdb_func = method.get_pdb_function(Some(&self.name), il2cpp);
+            let pdb_func = method.get_pdb_function(Some(&self.name), il2cpp, true);
             let func_ptr_type = PDBType::Pointer(Box::new(PDBType::Function(pdb_func)));
             let offset = vtable_index as u64 * 8 + 8;
             vtable_fields.push(StructField {
@@ -363,6 +377,11 @@ impl REMethod {
     pub fn symbol_name(&self, r#type: &REType) -> String {
         format!("{}::{}", r#type.name, self.name)
     }
+
+    pub fn thunked_symbol_name(&self, r#type: &REType) -> String {
+        format!("{}::native_{}", r#type.name, self.name)
+    }
+
     pub fn signature(&self, r#type: &REType) -> String {
         let params = self
             .params
@@ -392,7 +411,35 @@ impl REMethod {
         signature
     }
 
-    pub fn get_pdb_function(&self, class: Option<&str>, il2cpp: &Il2Cpp) -> PDBFunction {
+    pub fn thunked_signature(&self, r#type: &REType) -> String {
+        let params = self
+            .params
+            .as_ref()
+            .map(|p| {
+                let mut params = String::new();
+                for (i, param) in p.iter().enumerate() {
+                    if !param.r#type.is_empty() {
+                        params.push_str(&param.r#type);
+                    } else {
+                        params.push_str("void *");
+                    }
+                    if !param.name.is_empty() {
+                        params.push(' ');
+
+                        params.push_str(&param.name);
+                    }
+                    if i + 1 != p.len() {
+                        params.push(',');
+                    }
+                }
+                params
+            })
+            .unwrap_or("".to_string());
+        let signature = format!("native_{}({})", self.symbol_name(r#type), params);
+        signature 
+    }
+
+    pub fn get_pdb_function(&self, class: Option<&str>, il2cpp: &Il2Cpp, has_vmctx: bool) -> PDBFunction {
         let ret_type = self
             .returns
             .as_ref()
@@ -402,9 +449,13 @@ impl REMethod {
             .unwrap_or_else(|| PDBType::SimpleType(SimpleTypeKind::Void));
 
         // vmctx passed in here
-        let mut param_types = vec![PDBType::Pointer(Box::new(PDBType::SimpleType(
-            SimpleTypeKind::Void,
-        )))];
+        let mut param_types = vec![];
+        if has_vmctx {
+            param_types.push(PDBType::Pointer(Box::new(
+                        PDBType::SimpleType(SimpleTypeKind::Void)
+                        ))
+                )
+        }
 
         if self.impl_flags.contains(&REImplFlag::HasThis) {
             if let Some(class_name) = class {
